@@ -1,10 +1,10 @@
-# app.py — Check-up Takip Sistemi (tam sürüm, Eda için)
+# app.py — Check-up Takip Sistemi (düzeltilmiş sade sürüm)
 # Özellikler:
-# - Giriş (admin: admin / Edam456+), kullanıcı/rol/telefon, bildirim açık-kapalı
+# - Giriş (admin: admin / Edam456+), kullanıcı/rol/telefon, bildirim açık/kapalı
 # - Hasta kaydı + liste/filtre + Excel’e aktar
 # - Paket yönetimi
 # - Tetkik planlama: "Hasta Seç" dropdown, tarih/saat seçici, +10dk/+30dk/+1saat
-# - Raporlar: tarih aralığına duyarlı metrikler ve özetler
+# - Raporlar: tarih aralığına duyarlı metrikler
 # - WhatsApp entegrasyonuna hazır (Twilio secrets varsa çalışır; yoksa sessiz geçer)
 
 import os, io, sqlite3, hashlib
@@ -106,7 +106,7 @@ def login_view():
         if row and row["pass_hash"] == sha256(p):
             st.session_state.user = dict(row)
             st.success("Giriş başarılı.")
-            st.experimental_rerun()
+            st.rerun()
         else:
             st.error("Kullanıcı adı veya şifre hatalı.")
 
@@ -122,6 +122,7 @@ user = st.session_state.user
 st.sidebar.markdown(f"**{APP_TITLE}**")
 st.sidebar.caption(f"Giriş yapan: **{user['username']}** ({user['role']})")
 
+# Bildirim anahtarı (kayıt)
 notify_toggle = st.sidebar.toggle("Bildirimleri Aç/Kapat", value=bool(user.get("notify_enabled",1)))
 with closing(conn_open()) as conn, conn:
     conn.execute("UPDATE users SET notify_enabled=? WHERE id=?",(1 if notify_toggle else 0, user["id"]))
@@ -161,8 +162,7 @@ def send_whatsapp(to_number: str, body: str) -> bool:
         client = Client(sid, token)
         msg = client.messages.create(body=body, from_=wfrom, to=f"whatsapp:{to_number}")
         return bool(msg.sid)
-    except Exception as e:
-        st.warning(f"WhatsApp gönderilemedi: {e}")
+    except Exception:
         return False
 
 # ---------------------- Sayfalar ----------------------
@@ -310,7 +310,7 @@ elif menu == "Raporlar":
     colA, colB, colC = st.columns(3)
     colA.metric("Seçili Aralıkta Hasta", len(pdf))
     colB.metric("Toplam Fatura (TL)", f"{pdf['amount_billed'].fillna(0).sum():,.2f}".replace(",", "."))
-    # ort. tamamlanma süresi
+
     def to_dt(x):
         try: return datetime.fromisoformat(x)
         except: return None
@@ -323,7 +323,6 @@ elif menu == "Raporlar":
     else:
         colC.metric("Ortalama Tamamlama", "veri yok")
 
-    # Paket dağılımı tablosu
     st.subheader("Paket Kullanım Dağılımı")
     if not pdf.empty:
         pack_counts = pdf["package"].value_counts().reset_index()
