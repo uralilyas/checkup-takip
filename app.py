@@ -1,4 +1,4 @@
-# app.py — Check-up Takip Sistemi (düzeltilmiş sade sürüm)
+# app.py — Check-up Takip Sistemi (Eda için tek parça, örnek verili)
 # Özellikler:
 # - Giriş (admin: admin / Edam456+), kullanıcı/rol/telefon, bildirim açık/kapalı
 # - Hasta kaydı + liste/filtre + Excel’e aktar
@@ -6,6 +6,7 @@
 # - Tetkik planlama: "Hasta Seç" dropdown, tarih/saat seçici, +10dk/+30dk/+1saat
 # - Raporlar: tarih aralığına duyarlı metrikler
 # - WhatsApp entegrasyonuna hazır (Twilio secrets varsa çalışır; yoksa sessiz geçer)
+# - Örnek veri otomatik yüklenir (tek seferlik)
 
 import os, io, sqlite3, hashlib
 from contextlib import closing
@@ -68,9 +69,9 @@ def db_init():
             FOREIGN KEY(patient_id) REFERENCES patients(id)
         )""")
 
-        # Admin oluştur
+        # Admin oluştur (önce env/secrets, yoksa varsayılan: admin / Edam456+)
         admin_u = os.getenv("ADMIN_USERNAME", st.secrets.get("ADMIN_USERNAME", "admin"))
-        admin_p = os.getenv("ADMIN_PASSWORD", st.secrets.get("ADMIN_PASSWORD", "admin"))
+        admin_p = os.getenv("ADMIN_PASSWORD", st.secrets.get("ADMIN_PASSWORD", "Edam456+"))
         if conn.execute("SELECT 1 FROM users WHERE username=?", (admin_u,)).fetchone() is None:
             conn.execute("INSERT INTO users(username,pass_hash,full_name,role,notify_enabled) VALUES(?,?,?,?,1)",
                          (admin_u, sha256(admin_p), "Yönetici (Admin)", "admin"))
@@ -89,6 +90,43 @@ def db_init():
 
 db_init()
 
+# ---------------------- Örnek veri (tek seferlik) ----------------------
+def add_sample_data_once():
+    with closing(conn_open()) as conn:
+        existing = conn.execute("SELECT COUNT(1) AS c FROM patients").fetchone()["c"]
+    if existing and existing > 0:
+        return  # zaten var, ekleme
+
+    from datetime import date as _date
+    with closing(conn_open()) as conn, conn:
+        sample_patients = [
+            ("H001", "Ahmet Yılmaz", "1980-05-12", "+905551112233", "Genel Tarama", "Koordinatör A", _date.today(), 1500, "Not yok"),
+            ("H002", "Ayşe Demir", "1992-03-22", "+905552223344", "VIP", "Koordinatör B", _date.today() + timedelta(days=1), 3500, "VIP müşteri"),
+            ("H003", "Mehmet Kara", "1985-07-15", "+905553334455", "Kadın Sağlığı", "Koordinatör C", _date.today() - timedelta(days=2), 2500, "Hızlı işlem"),
+        ]
+        for p in sample_patients:
+            try:
+                conn.execute("""INSERT INTO patients
+                    (patient_code, full_name, dob, phone, package, coordinator, checkup_date, amount_billed, notes)
+                    VALUES (?,?,?,?,?,?,?,?,?)""", p)
+            except sqlite3.IntegrityError:
+                pass
+
+        # Hasta id'lerini al
+        ids = [r["id"] for r in conn.execute("SELECT id FROM patients ORDER BY id").fetchall()]
+        if len(ids) >= 3:
+            sample_tests = [
+                (ids[0], "Kan Tahlili", f"{_date.today()} 09:00", "Planlandı"),
+                (ids[0], "Röntgen", f"{_date.today()} 10:00", "Planlandı"),
+                (ids[1], "EKO", f"{_date.today()} 11:00", "Planlandı"),
+                (ids[2], "Kadın Doğum Muayenesi", f"{_date.today()} 14:00", "Planlandı"),
+            ]
+            for t in sample_tests:
+                conn.execute("""INSERT INTO tests (patient_id, test_name, planned_at, status)
+                                VALUES (?,?,?,?)""", t)
+
+add_sample_data_once()
+
 # ---------------------- Giriş / Oturum ----------------------
 st.set_page_config(page_title=APP_TITLE, page_icon="🏥", layout="wide")
 
@@ -98,6 +136,7 @@ if "user" not in st.session_state:
 def login_view():
     st.title(APP_TITLE)
     st.subheader("Giriş Yap")
+    # Giriş kutusunda varsayılan kullanıcı adını göstermek işini hızlandırır
     u = st.text_input("Kullanıcı adı", value=os.getenv("ADMIN_USERNAME", st.secrets.get("ADMIN_USERNAME","admin")))
     p = st.text_input("Şifre", type="password")
     if st.button("Giriş", type="primary"):
@@ -404,5 +443,3 @@ elif menu == "Test Uyarısı (Manuel)":
             st.success("Gönderildi.")
         else:
             st.warning("Gönderilemedi. Twilio bilgilerini Secrets’a eklediğinden ve numaranın Sandbox’a kayıtlı olduğundan emin ol.")
-
-
