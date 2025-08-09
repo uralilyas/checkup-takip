@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+checkup_tracker.db
+.streamlit/secrets.toml
