@@ -1,4 +1,5 @@
-import os, sqlite3
+# app.py
+import os, sqlite3, csv, io
 from datetime import datetime, date
 from contextlib import closing
 import streamlit as st
@@ -57,6 +58,17 @@ init_db()
 # ---------------- Utils ----------------
 def now_str(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 def normalize_phone(p:str)->str: return p.replace(" ","").replace("-","")
+
+def export_csv(query:str, params:tuple=()) -> bytes:
+    with closing(get_conn()) as conn, closing(conn.cursor()) as c:
+        c.execute(query, params)
+        rows = c.fetchall()
+        headers = [d[0] for d in c.description]
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(headers)
+    writer.writerows(rows)
+    return buf.getvalue().encode("utf-8")
 
 # ---------------- Personnel ----------------
 def list_personnel(active_only=True):
@@ -155,7 +167,10 @@ def auto_message_for_patient(patient_id:int):
     remain = [t[4] for t in trs if t[5] == "bekliyor"]
     with closing(get_conn()) as conn, closing(conn.cursor()) as c:
         c.execute("SELECT first_name,last_name FROM patients WHERE id=?", (patient_id,))
-        fn, ln = c.fetchone()
+        row = c.fetchone()
+    if not row:
+        return
+    fn, ln = row
     body = (f"{fn} {ln} için tetkik güncellemesi:\n"
             f"Tamamlananlar: {', '.join(done) if done else '-'}\n"
             f"Kalanlar: {', '.join(remain) if remain else '-'}")
@@ -166,7 +181,7 @@ def auto_message_for_patient(patient_id:int):
 # ---------------- Auth ----------------
 def require_login():
     if "auth" not in st.session_state:
-        st.session_state.auth = {"logged_in": False}
+        st.session_state.auth = {"logged_in": False, "username": ""}
     if not st.session_state.auth["logged_in"]:
         with st.form("login_form"):
             st.subheader("🔐 Giriş")
@@ -174,7 +189,7 @@ def require_login():
             p = st.text_input("Parola", type="password")
             if st.form_submit_button("Giriş Yap"):
                 if u == ADMIN_USERNAME and p == ADMIN_PASSWORD:
-                    st.session_state.auth["logged_in"] = True
+                    st.session_state.auth = {"logged_in": True, "username": u}
                     st.success("Admin olarak giriş yapıldı.")
                     st.rerun()
                 else:
@@ -194,7 +209,7 @@ sel_date_str = selected_date.strftime("%Y-%m-%d")
 with st.sidebar:
     st.divider()
     st.subheader("🔌 Bağlantı Durumu")
-    st.write("• Twilio:", "✅" if _twilio_ok and TWILIO_ACCOUNT_SID else "⚠️ Ayarları kontrol edin")
+    st.write("• Twilio:", "✅" if (_twilio_ok and TWILIO_ACCOUNT_SID) else "⚠️ Ayarları kontrol edin")
     try:
         with closing(get_conn()) as conn, closing(conn.cursor()) as c:
             c.execute("SELECT COUNT(*) FROM patients WHERE visit_date=?", (sel_date_str,))
@@ -203,15 +218,15 @@ with st.sidebar:
                          JOIN patients p ON p.id=t.patient_id
                          WHERE p.visit_date=? AND t.status='tamamlandi'""", (sel_date_str,))
             tc_done = c.fetchone()[0]
-        st.write(f"• DB: ✅ (Günlük Hasta: {pc}, Tamamlanan Tetkik: {tc_done})")
+        st.write(f"• DB: ✅  —  Günlük Hasta: {pc}  |  Tamamlanan Tetkik: {tc_done}")
     except Exception:
         st.write("• DB: ⚠️")
     if st.button("🚪 Çıkış", key="logout_btn"):
-        st.session_state.auth["logged_in"] = False
+        st.session_state.auth = {"logged_in": False, "username": ""}
         st.rerun()
 
-tab_hasta, tab_tetkik, tab_ozet, tab_mesaj, tab_personel = st.tabs(
-    ["🧑‍⚕️ Hastalar", "🧪 Tetkik Takibi", "📊 Gün Özeti", "📲 WhatsApp Mesaj", "👥 Personel"]
+tab_hasta, tab_tetkik, tab_ozet, tab_mesaj, tab_personel, tab_yedek = st.tabs(
+    ["🧑‍⚕️ Hastalar", "🧪 Tetkik Takibi", "📊 Gün Özeti", "📲 WhatsApp Mesaj", "👥 Personel", "💾 Yedek / Dışa Aktar"]
 )
 
 # ---------------- Hastalar ----------------
@@ -367,3 +382,30 @@ with tab_personel:
             delete_personnel(choice[0])
             st.success("Personel ve ilgili mesaj kayıtları silindi.")
             st.rerun()
+
+# ---------------- Yedek / Dışa Aktar ----------------
+with tab_yedek:
+    st.subheader("💾 Yedek / Dışa Aktar")
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Hastalar (CSV) indir", key="dl_patients_csv"):
+            data = export_csv("SELECT * FROM patients")
+            st.download_button("İndir – patients.csv", data, "patients.csv", "text/csv", key="dl_patients_csv_btn")
+        if st.button("Tetkikler (CSV) indir", key="dl_tests_csv"):
+            data = export_csv("SELECT * FROM patient_tests")
+            st.download_button("İndir – patient_tests.csv", data, "patient_tests.csv", "text/csv", key="dl_tests_csv_btn")
+    with col2:
+        if st.button("Personel (CSV) indir", key="dl_personnel_csv"):
+            data = export_csv("SELECT * FROM personnel")
+            st.download_button("İndir – personnel.csv", data, "personnel.csv", "text/csv", key="dl_personnel_csv_btn")
+        if st.button("Mesaj Logları (CSV) indir", key="dl_logs_csv"):
+            data = export_csv("SELECT * FROM msg_logs")
+            st.download_button("İndir – msg_logs.csv", data, "msg_logs.csv", "text/csv", key="dl_logs_csv_btn")
+
+    st.divider()
+    # DB dosyasını doğrudan indir
+    if os.path.exists(DB_PATH):
+        with open(DB_PATH, "rb") as f:
+            st.download_button("📦 Tüm Veritabanını İndir (checkup.db)", f.read(), DB_PATH, "application/octet-stream", key="dl_db_btn")
+    else:
+        st.info("Veritabanı dosyası henüz oluşmadı.")
