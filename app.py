@@ -4,7 +4,7 @@ from datetime import datetime, date, timedelta
 from contextlib import closing
 import streamlit as st
 
-# ================== CONFIG ==================
+# ============== CONFIG ==============
 DB_PATH = "checkup.db"
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
@@ -18,7 +18,7 @@ try:
 except Exception:
     _twilio_ok = False
 
-# ================== DB HELPERS ==================
+# ============== DB ==============
 def get_conn():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
@@ -45,12 +45,12 @@ def init_db():
             visit_date TEXT NOT NULL,
             created_at TEXT NOT NULL
         )""")
-        # --- MIGRATIONS: add department + visit_time if missing ---
+        # Migrations
         if not column_exists(conn, "patients", "department"):
             c.execute("ALTER TABLE patients ADD COLUMN department TEXT")
+            c.execute("UPDATE patients SET department='Genel' WHERE department IS NULL")
         if not column_exists(conn, "patients", "visit_time"):
-            c.execute("ALTER TABLE patients ADD COLUMN visit_time TEXT")  # HH:MM (nullable)
-
+            c.execute("ALTER TABLE patients ADD COLUMN visit_time TEXT")  # HH:MM
         c.execute("""CREATE TABLE IF NOT EXISTS patient_tests(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             patient_id INTEGER NOT NULL,
@@ -69,15 +69,15 @@ def init_db():
             FOREIGN KEY (personnel_id) REFERENCES personnel(id)
         )""")
 
-init_db()  # tablo + migration tamam
+init_db()
 
-# ================== UTILS ==================
+# ============== UTILS ==============
 def now_str(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 def to_iso(d:date) -> str: return d.strftime("%Y-%m-%d")
-def to_display(d:date) -> str: return d.strftime("%d/%m/%Y")  # Gün/Ay/Yıl
+def to_display(d:date) -> str: return d.strftime("%d/%m/%Y")
 def normalize_phone(p:str)->str: return p.replace(" ","").replace("-","")
 
-# ================== PERSONNEL ==================
+# ============== PERSONNEL ==============
 def list_personnel(active_only=True):
     with closing(get_conn()) as conn, closing(conn.cursor()) as c:
         q = "SELECT id,name,phone,active FROM personnel"
@@ -89,7 +89,7 @@ def list_personnel(active_only=True):
 def add_personnel(name:str, phone:str):
     phone = normalize_phone(phone)
     if not phone.startswith("+"):
-        raise ValueError("Telefon + ile başlamalı (ör. +90...)")
+        raise ValueError("Telefon + ile başlamalı (örn. +90...)")
     with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
         c.execute("INSERT INTO personnel(name,phone,created_at) VALUES(?,?,?)",
                   (name.strip(), phone.strip(), now_str()))
@@ -99,12 +99,12 @@ def delete_personnel(pid:int):
         c.execute("DELETE FROM msg_logs WHERE personnel_id=?", (pid,))
         c.execute("DELETE FROM personnel WHERE id=?", (pid,))
 
-# ================== PATIENTS ==================
-def add_patient(fn:str, ln:str, age:int, gender:str, dept:str, visit_date_iso:str, visit_time_hhmm:str|None):
+# ============== PATIENTS ==============
+def add_patient(fn:str, ln:str, age:int, gender:str, visit_date_iso:str):
     with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
         c.execute("""INSERT INTO patients(first_name,last_name,age,gender,visit_date,created_at,department,visit_time)
                      VALUES(?,?,?,?,?,?,?,?)""",
-                  (fn.strip(), ln.strip(), age, gender, visit_date_iso, now_str(), (dept or "Genel").strip(), visit_time_hhmm))
+                  (fn.strip(), ln.strip(), age, gender, visit_date_iso, now_str(), "Genel", None))
 
 def delete_patient(pid:int):
     with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
@@ -126,7 +126,7 @@ def set_patient_alarm_time(patient_id:int, hhmm:str|None):
     with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
         c.execute("UPDATE patients SET visit_time=? WHERE id=?", (hhmm, patient_id))
 
-# ================== TESTS ==================
+# ============== TESTS ==============
 def add_patient_test(patient_id:int, test_name:str):
     with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
         c.execute("""INSERT INTO patient_tests(patient_id,test_name,status,updated_at)
@@ -150,7 +150,11 @@ def update_patient_test_status(test_id:int, new_status:str):
         c.execute("UPDATE patient_tests SET status=?, updated_at=? WHERE id=?",
                   (new_status, now_str(), test_id))
 
-# ================== MESSAGING ==================
+def delete_patient_test(test_id:int):
+    with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
+        c.execute("DELETE FROM patient_tests WHERE id=?", (test_id,))
+
+# ============== MESSAGING ==============
 def send_whatsapp_message(to_phone:str, body:str)->tuple[bool,str]:
     if not _twilio_ok: return False, "Twilio paketi yok"
     if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_WHATSAPP_FROM):
@@ -189,7 +193,7 @@ def auto_message_for_patient(pid:int):
         ok, info = send_whatsapp_message(staff[2], body)
         log_message(staff[0], body, ok, info)
 
-# ================== ALARM (10 dk önce) ==================
+# ============== ALARM (10 dk önce) ==============
 def check_alarms_loop():
     """Her dakika bugüne ait, saati tanımlı randevuları kontrol eder; 10 dk kala personele WhatsApp atar."""
     while True:
@@ -201,7 +205,7 @@ def check_alarms_loop():
                          WHERE visit_date=? AND visit_time=?""", (today_iso, now_plus_10))
             matches = c.fetchall()
         if matches:
-            for (fn, ln, dept, vtime) in matches:
+            for (fn, ln, dept, _vtime) in matches:
                 body = (f"📅 Hatırlatma:\n"
                         f"{fn} {ln}'ın 10 dakika sonra {dept or 'İlgili bölüm'} randevusu bulunmaktadır.\n"
                         f"Lütfen bölüm ile teyit sağlayarak hastaya eşlik ediniz.")
@@ -210,12 +214,11 @@ def check_alarms_loop():
                     log_message(staff[0], body, ok, info)
         time.sleep(60)
 
-# Thread'i yalnızca bir kez başlat
 if "alarm_thread_started" not in st.session_state:
     threading.Thread(target=check_alarms_loop, daemon=True).start()
     st.session_state.alarm_thread_started = True
 
-# ================== AUTH ==================
+# ============== AUTH ==============
 def require_login():
     if "auth" not in st.session_state:
         st.session_state.auth = {"logged_in": False}
@@ -233,12 +236,12 @@ def require_login():
                     st.error("Hatalı kullanıcı adı/parola.")
         st.stop()
 
-# ================== UI ==================
+# ============== UI ==============
 st.set_page_config(page_title="Check-up Takip", page_icon="✅", layout="wide")
 st.title("✅ Check-up Takip Sistemi")
 require_login()
 
-# Tarih (ekranda GG/AA/YYYY; DB'de ISO)
+# Tarih
 picked_date = st.sidebar.date_input("📅 Tarih seç", value=date.today(), key="dt_pick")
 sel_iso = to_iso(picked_date)
 sel_disp = to_display(picked_date)
@@ -252,17 +255,16 @@ with st.sidebar:
         st.session_state.auth["logged_in"] = False
         st.rerun()
 
-# Sekmeler
 tab_hasta, tab_tetkik, tab_ozet, tab_mesaj, tab_personel, tab_yedek = st.tabs(
     ["🧑‍⚕️ Hastalar", "🧪 Tetkik Takibi", "📊 Gün Özeti", "📲 WhatsApp Mesaj", "👥 Personel", "💾 Yedek"]
 )
 
-# -------- 🧑‍⚕️ Hastalar --------
+# -------- Hastalar --------
 with tab_hasta:
     st.subheader(f"{sel_disp} — Hasta Listesi")
     pts = list_patients(visit_date_iso=sel_iso)
     st.dataframe(
-        [{"ID":p[0], "Ad":p[1], "Soyad":p[2], "Bölüm":p[5] or "-", "Alarm Saati":p[6] or "-"} for p in pts],
+        [{"ID":p[0], "Ad":p[1], "Soyad":p[2], "Alarm Saati":p[6] or "-"} for p in pts],
         use_container_width=True
     )
 
@@ -272,24 +274,22 @@ with tab_hasta:
         fn = c1.text_input("Ad")
         ln = c2.text_input("Soyad")
         age = c3.number_input("Yaş", 0, 120, 0, 1)
-        c4,c5 = st.columns([2,2])
-        gender = c4.selectbox("Cinsiyet", ["Kadın","Erkek","Diğer"])
-        dept = c5.text_input("Bölüm (manuel)", placeholder="Kardiyoloji, Dahiliye, ...")
+        gender = st.selectbox("Cinsiyet", ["Kadın","Erkek","Diğer"])
         submitted = st.form_submit_button("Ekle")
     if submitted:
         if not fn.strip() or not ln.strip():
             st.warning("Ad ve Soyad zorunludur.")
         else:
             try:
-                add_patient(fn, ln, int(age), gender, dept or "Genel", sel_iso, None)  # saat yok
-                st.success(f"Eklendi: {fn} {ln} • {dept or 'Genel'}")
+                add_patient(fn, ln, int(age), gender, sel_iso)
+                st.success(f"Eklendi: {fn} {ln}")
                 st.rerun()
             except Exception as e:
                 st.error(f"Hata: {e}")
 
     if pts:
         st.markdown("### 🗑️ Hasta Sil")
-        choice = st.selectbox("Silinecek", [(p[0], f"{p[1]} {p[2]} — {p[5] or '-'}") for p in pts],
+        choice = st.selectbox("Silinecek", [(p[0], f"{p[1]} {p[2]}") for p in pts],
                               format_func=lambda x: x[1], key="sel_del_patient")
         if st.button("Sil", type="primary", key="btn_del_patient"):
             delete_patient(choice[0])
@@ -298,7 +298,7 @@ with tab_hasta:
     else:
         st.caption("Bu tarihte kayıtlı hasta yok.")
 
-# -------- 🧪 Tetkik Takibi --------
+# -------- Tetkik Takibi --------
 with tab_tetkik:
     pts_today = list_patients(visit_date_iso=sel_iso)
     if not pts_today:
@@ -306,7 +306,7 @@ with tab_tetkik:
     else:
         sel = st.selectbox(
             "Hasta",
-            [(p[0], f"{p[1]} {p[2]} — {p[5] or '-'}") for p in pts_today],
+            [(p[0], f"{p[1]} {p[2]}") for p in pts_today],
             format_func=lambda x: x[1],
             key="sel_patient_tests"
         )
@@ -316,18 +316,21 @@ with tab_tetkik:
         with st.form("frm_add_test", clear_on_submit=True):
             tname = st.text_input("Tetkik adı (örn. MR, Kan, EKG)")
             alarm_check = st.checkbox("🔔 Alarm kurmak istiyorum")
-            alarm_time = None
+            alarm_hhmm = None
             if alarm_check:
-                alarm_time = st.time_input("Alarm Randevu Saati")
+                colh, colm = st.columns(2)
+                hour = colh.selectbox("Saat", [f"{h:02d}" for h in range(0,24)], key="alarm_hour")
+                minute = colm.selectbox("Dakika", [f"{m:02d}" for m in range(0,60,5)], key="alarm_minute")
+                alarm_hhmm = f"{hour}:{minute}"  # Safari uyumlu (selectbox)
             addt = st.form_submit_button("Ekle")
         if addt:
             if not tname.strip():
                 st.warning("Tetkik adı boş olamaz.")
             else:
                 add_patient_test(pid, tname)
-                if alarm_check and alarm_time:
-                    set_patient_alarm_time(pid, alarm_time.strftime("%H:%M"))
-                st.success("Tetkik eklendi" + (" ve alarm kuruldu." if (alarm_check and alarm_time) else "."))
+                if alarm_check and alarm_hhmm:
+                    set_patient_alarm_time(pid, alarm_hhmm)
+                st.success("Tetkik eklendi" + (f" ve alarm {alarm_hhmm} için kuruldu." if (alarm_check and alarm_hhmm) else "."))
                 st.rerun()
 
         st.markdown("#### Tetkikler")
@@ -339,7 +342,7 @@ with tab_tetkik:
         else:
             for t in trs:
                 tid, _, fn, ln, tname, tstatus, updated = t
-                c = st.columns([6,2,2])
+                c = st.columns([6,2,2,2])
                 c[0].write(f"**{tname}** — {fn} {ln} • {updated}")
                 if tstatus == "bekliyor":
                     if c[1].button("Tamamla", key=f"done_{tid}"):
@@ -353,8 +356,12 @@ with tab_tetkik:
                         auto_message_for_patient(pid)
                         st.info("Geri alındı ve mesaj gönderildi.")
                         st.rerun()
+                if c[3].button("Sil", key=f"del_test_{tid}"):
+                    delete_patient_test(tid)
+                    st.warning("Tetkik silindi.")
+                    st.rerun()
 
-# -------- 📊 Gün Özeti --------
+# -------- Gün Özeti --------
 with tab_ozet:
     st.subheader(f"{sel_disp} — Gün Özeti")
     pts = list_patients(visit_date_iso=sel_iso)
@@ -368,14 +375,13 @@ with tab_ozet:
             remain = [t[4] for t in tests if t[5]=="bekliyor"]
             rows.append({
                 "Hasta": f"{p[1]} {p[2]}",
-                "Bölüm": p[5] or "-",
                 "Alarm Saati": p[6] or "-",
                 "Tamamlanan": ", ".join(done) if done else "-",
                 "Kalan": ", ".join(remain) if remain else "-"
             })
         st.dataframe(rows, use_container_width=True)
 
-# -------- 📲 WhatsApp Mesaj (manuel) --------
+# -------- WhatsApp Mesaj (manuel) --------
 with tab_mesaj:
     st.subheader("WhatsApp Mesaj (Personel)")
     staff = list_personnel(active_only=True)
@@ -387,7 +393,7 @@ with tab_mesaj:
         msg = st.text_area("Mesaj", height=120, key="ms_body")
         if st.button("Gönder", key="ms_send"):
             okc, errc = 0, 0
-            for sid, _label in sel_staff:
+            for sid, _ in sel_staff:
                 phone = [x[2] for x in staff if x[0]==sid][0]
                 ok, info = send_whatsapp_message(phone, msg)
                 log_message(sid, msg, ok, info)
@@ -397,7 +403,7 @@ with tab_mesaj:
             elif okc and errc:   st.warning(f"{okc} başarılı, {errc} hatalı.")
             else:                st.error("Gönderim başarısız.")
 
-# -------- 👥 Personel --------
+# -------- Personel --------
 with tab_personel:
     st.subheader("Personel")
     people = list_personnel(active_only=False)
@@ -425,7 +431,7 @@ with tab_personel:
             st.success("Personel silindi.")
             st.rerun()
 
-# -------- 💾 Yedek --------
+# -------- Yedek --------
 with tab_yedek:
     st.subheader("Yedek / Dışa Aktar (CSV)")
     col1, col2 = st.columns(2)
