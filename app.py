@@ -1,8 +1,10 @@
-# app.py — DB'siz geçici sürüm (sadece çalışırlık)
+# app.py — Güncellenmiş sürüm
 import os
+import time
 from datetime import date
 import streamlit as st
 from twilio.rest import Client
+import psycopg2
 
 # ---- Secrets / Config ----
 def S(key, default=""):
@@ -13,12 +15,14 @@ def S(key, default=""):
 
 ADMIN_USERNAME = S("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = S("ADMIN_PASSWORD", "changeme")
-TWILIO_SID    = S("TWILIO_ACCOUNT_SID", "")
-TWILIO_TOKEN  = S("TWILIO_AUTH_TOKEN", "")
-TWILIO_FROM   = S("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886")
-WEBHOOK_HOST  = S("WEBHOOK_HOST", "")
+TWILIO_SID     = S("TWILIO_ACCOUNT_SID", "")
+TWILIO_TOKEN   = S("TWILIO_AUTH_TOKEN", "")
+TWILIO_FROM    = S("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886")
+STAFF_TO       = S("STAFF_WHATSAPP_TO", "")
+DATABASE_URL   = S("DATABASE_URL", "")
+DEBUG          = S("DEBUG", "false").lower() == "true"
 
-st.set_page_config(page_title="Check-up Takip (Geçici - DB Kapalı)", page_icon="✅", layout="wide")
+st.set_page_config(page_title="Check-up Takip", layout="wide")
 
 # ---- Auth ----
 def ensure_auth():
@@ -40,30 +44,67 @@ def ensure_auth():
 if not ensure_auth():
     st.stop()
 
-# ---- In-memory (oturumluk) veri yapısı ----
-if "records" not in st.session_state:
-    st.session_state.records = []  # [{name, phone, pkg, cdate, tasks:[{title,done}]}]
+# ---- Güvenli DB init ----
+def db_conn():
+    return psycopg2.connect(
+        DATABASE_URL,
+        sslmode="require",
+        connect_timeout=5,
+    )
 
-# ---- WhatsApp gönderimi ----
-def send_whatsapp(to_phone: str, body: str):
+def db_exec(sql, params=None):
+    with db_conn() as con:
+        with con.cursor() as cur:
+            cur.execute(sql, params or ())
+            try:
+                return cur.fetchall()
+            except psycopg2.ProgrammingError:
+                return None
+
+def db_init_safe():
+    retries = 3
+    for attempt in range(1, retries+1):
+        try:
+            db_exec("""
+                CREATE TABLE IF NOT EXISTS patients (
+                    id SERIAL PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    phone TEXT NOT NULL UNIQUE
+                );
+            """)
+            return True
+        except Exception as e:
+            if attempt == retries:
+                st.error("Veritabanına bağlanılamadı. Lütfen sonra tekrar deneyin.")
+                if DEBUG: st.caption(str(e))
+                return False
+            time.sleep(2)
+            continue
+
+if "db_ready" not in st.session_state:
+    st.session_state.db_ready = db_init_safe()
+
+# ---- In-memory kayıtlar (DB kapalıysa) ----
+if "records" not in st.session_state:
+    st.session_state.records = []
+
+# ---- WhatsApp gönderim fonksiyonu ----
+def send_whatsapp(to_number: str, body: str):
     try:
-        if not to_phone.startswith("whatsapp:"):
-            to_phone = f"whatsapp:{to_phone}"
+        if not to_number.startswith("whatsapp:"):
+            to_number = f"whatsapp:{to_number}"
         client = Client(TWILIO_SID, TWILIO_TOKEN)
-        client.messages.create(from_=TWILIO_FROM, to=to_phone, body=body)
-        return True
+        client.messages.create(from_=TWILIO_FROM, to=to_number, body=body)
+        return True, None
     except Exception as e:
-        st.error(f"Twilio gönderim hatası: {e}")
-        return False
+        return False, str(e)
 
 # ---- UI ----
-st.title("✅ Check-up Takip (Geçici Sürüm – Veritabanı KAPALI)")
-st.caption("Bu ekran DB'ye BAĞLANMADAN çalışır. Kayıtlar sadece bu oturum boyunca tutulur.")
-with st.sidebar:
-    st.markdown(f"**Webhook (Twilio):** `{WEBHOOK_HOST}/twilio/whatsapp`")
+st.title("✅ Check-up Takip")
+st.caption("Hasta / Personel mesaj gönderimi ve görev takibi")
 
 # Yeni kayıt formu
-st.subheader("📝 Yeni Check-up Kaydı (oturumda saklanır)")
+st.subheader("📝 Yeni Check-up Kaydı")
 with st.form("new"):
     name  = st.text_input("Ad Soyad")
     phone = st.text_input("Telefon (+90...)")
@@ -82,7 +123,7 @@ with st.form("new"):
             st.success(f"Kayıt eklendi: {name} • {pkg} • {cdate}")
 
 # Bugünün listesi
-st.subheader("📆 Bugünün Check-up Listesi (oturum)")
+st.subheader("📆 Bugünün Check-up Listesi")
 if not st.session_state.records:
     st.info("Henüz kayıt yok.")
 else:
@@ -100,13 +141,23 @@ else:
                         t["done"] = True
                         st.rerun()
 
-            # WhatsApp ile durum gönder
+            # WhatsApp gönderim
+            st.markdown("### 📲 Mesaj Gönder")
+            kime = st.radio("Mesaj alıcısı", ["Hasta", "Personel"], horizontal=True, key=f"who_{idx}")
+            if kime == "Hasta":
+                to_num = rec["phone"]
+            else:
+                to_num = STAFF_TO or st.text_input("Personel numarası (+90...)", key=f"staff_{idx}")
             if st.button("Durumu WhatsApp ile Gönder", key=f"msg_{idx}"):
                 body = "Check-up Durumunuz:\n"
                 body += "- Bekleyen: " + (", ".join([t['title'] for t in pending]) if pending else "Yok") + "\n"
                 body += "- Tamamlanan: " + (", ".join([t['title'] for t in done   ]) if done    else "Yok")
-                ok = send_whatsapp(rec["phone"], body)
-                st.success("WhatsApp gönderildi.") if ok else st.error("Gönderilemedi.")
+                ok, err = send_whatsapp(to_num, body)
+                if ok:
+                    st.success("WhatsApp gönderildi.")
+                else:
+                    st.error("Gönderilemedi.")
+                    if DEBUG: st.caption(err)
 
 st.divider()
-st.caption("Geçici sürüm: veriler kalıcı değildir. DB açıldığında otomatik olarak kalıcıya geçeceğiz.")
+st.caption("Versiyon 2.0 — DB güvenli başlatma + Mesaj alıcı seçimi + Debug temizliği")
