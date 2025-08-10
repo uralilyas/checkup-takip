@@ -1,4 +1,4 @@
-
+# app.py
 import os
 import sqlite3
 import threading
@@ -12,25 +12,26 @@ from fastapi import FastAPI, Form
 from fastapi.responses import PlainTextResponse
 import uvicorn
 
-# ======= Settings from Streamlit Secrets =======
-def get_secret(name: str, default: str = "") -> str:
+# ========= Ayarlar (Streamlit Secrets) =========
+def _secret(name: str, default: str = "") -> str:
+    # Streamlit Cloud: st.secrets
+    # Lokal/başka yer: ortam değişkeni fallback
     try:
         return st.secrets[name]
     except Exception:
-        # fallback to env var if running outside Streamlit (dev/testing)
         return os.getenv(name, default)
 
-TWILIO_SID = get_secret("TWILIO_ACCOUNT_SID")
-TWILIO_TOKEN = get_secret("TWILIO_AUTH_TOKEN")
-TWILIO_FROM = get_secret("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886")
-WEBHOOK_HOST = get_secret("WEBHOOK_HOST", "http://127.0.0.1:8000")
+TWILIO_SID   = _secret("TWILIO_ACCOUNT_SID")
+TWILIO_TOKEN = _secret("TWILIO_AUTH_TOKEN")
+TWILIO_FROM  = _secret("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886")
+WEBHOOK_HOST = _secret("WEBHOOK_HOST", "http://127.0.0.1:8000")
 
-ADMIN_USERNAME = get_secret("ADMIN_USERNAME", "admin")
-ADMIN_PASSWORD = get_secret("ADMIN_PASSWORD", "changeme")
+ADMIN_USERNAME = _secret("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = _secret("ADMIN_PASSWORD", "changeme")
 
 DB_PATH = "checkup.db"
 
-# ======= DB Helpers =======
+# ========= Veritabanı =========
 def db_connect():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -65,7 +66,7 @@ def db_init():
     cur.execute("""
     CREATE TABLE IF NOT EXISTS messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        direction TEXT NOT NULL,
+        direction TEXT NOT NULL,  -- inbound / outbound
         sender TEXT NOT NULL,
         receiver TEXT NOT NULL,
         body TEXT NOT NULL,
@@ -130,7 +131,7 @@ def insert_message(direction: str, sender: str, receiver: str, body: str):
     db_query("INSERT INTO messages(direction, sender, receiver, body, at) VALUES(?,?,?,?,?)",
              (direction, sender, receiver, body, at), commit=True)
 
-# ======= Twilio Send Helper =======
+# ========= Twilio Gönderim =========
 def send_whatsapp(to_phone: str, body: str) -> Optional[str]:
     if not to_phone.startswith("whatsapp:"):
         to_phone = f"whatsapp:{to_phone}"
@@ -140,10 +141,14 @@ def send_whatsapp(to_phone: str, body: str) -> Optional[str]:
         insert_message("outbound", TWILIO_FROM, to_phone, body)
         return msg.sid
     except Exception as e:
-        st.error(f"Twilio gönderim hatası: {e}")
+        # Streamlit’te göster
+        try:
+            st.error(f"Twilio gönderim hatası: {e}")
+        except Exception:
+            pass
         return None
 
-# ======= FastAPI Webhook =======
+# ========= FastAPI (Webhook) =========
 api = FastAPI(title="Check-up WhatsApp Webhook")
 
 @api.post("/twilio/whatsapp")
@@ -163,6 +168,7 @@ async def twilio_whatsapp(
         text_upper = body.upper()
 
         if text_upper.startswith("KAYIT"):
+            # KAYIT Ad Soyad; +905xx...; Paket; YYYY-MM-DD
             payload = body[5:].strip()
             parts = [p.strip() for p in payload.split(";")]
             if len(parts) != 4:
@@ -172,9 +178,18 @@ async def twilio_whatsapp(
             name, phone, package_name, check_date = parts
             pid = find_or_create_patient(name=name, phone=phone)
             cid = create_checkup(patient_id=pid, package_name=package_name, check_date=check_date)
-            default_tasks = ["Kan Tahlili", "EKG", "Radyoloji (Akciğer)", "Vücut Analizi", "Son Doktor Değerlendirmesi"]
+            default_tasks = [
+                "Kan Tahlili",
+                "EKG",
+                "Radyoloji (Akciğer)",
+                "Vücut Analizi",
+                "Son Doktor Değerlendirmesi"
+            ]
             add_tasks(cid, default_tasks)
-            resp.message(f"Kayıt oluşturuldu. Hasta: {name}, Tarih: {check_date}, Paket: {package_name}. Görev sayısı: {len(default_tasks)}")
+            resp.message(
+                f"Kayıt oluşturuldu. Hasta: {name}, Tarih: {check_date}, "
+                f"Paket: {package_name}. Görev sayısı: {len(default_tasks)}"
+            )
             return PlainTextResponse(str(resp), media_type="application/xml")
 
         elif text_upper.startswith("DURUM"):
@@ -193,11 +208,13 @@ async def twilio_whatsapp(
             tasks = list_tasks_for_checkup(row["checkup_id"])
             pending = [t["task_name"] for t in tasks if t["is_done"] == 0]
             done = [t["task_name"] for t in tasks if t["is_done"] == 1]
-            msg = "Durum:\n- Bekleyen: " + (", ".join(pending) if pending else "Yok") + "\n- Tamamlanan: " + (", ".join(done) if done else "Yok")
+            msg = "Durum:\n- Bekleyen: " + (", ".join(pending) if pending else "Yok") + \
+                  "\n- Tamamlanan: " + (", ".join(done) if done else "Yok")
             resp.message(msg)
             return PlainTextResponse(str(resp), media_type="application/xml")
 
         elif text_upper.startswith("YAPILDI"):
+            # YAPILDI EKG
             task_name = body[7:].strip()
             row = db_query("""
                 SELECT t.id as task_id
@@ -224,21 +241,25 @@ async def twilio_whatsapp(
         resp.message(f"Hata: {e}")
         return PlainTextResponse(str(resp), media_type="application/xml")
 
-# ======= API Server Thread =======
+# ========= API Sunucusunu Arka Planda Başlat =========
 _api_started = False
 def start_api_server_once():
+    """Uvicorn’u 8000’de başlat. Streamlit Cloud dışarıya açmasa da, kod hatasız sürer."""
     global _api_started
     if _api_started:
         return
     def run():
-        uvicorn.run(api, host="0.0.0.0", port=8000, log_level="warning")
+        try:
+            uvicorn.run(api, host="0.0.0.0", port=8000, log_level="warning")
+        except Exception:
+            # Ortam izin vermezse sessiz geç (UI çalışmaya devam etsin)
+            pass
     t = threading.Thread(target=run, daemon=True)
     t.start()
     _api_started = True
 
-# ======= Streamlit UI =======
+# ========= Basit Giriş (opsiyonel) =========
 def check_basic_auth():
-    # Very simple guard (optional)
     if "auth_ok" not in st.session_state:
         st.session_state.auth_ok = False
     if st.session_state.auth_ok:
@@ -256,6 +277,7 @@ def check_basic_auth():
                 st.error("Hatalı kullanıcı adı/parola")
     return st.session_state.auth_ok
 
+# ========= UI =========
 def ui_header():
     st.title("🏥 Check-up Takip Sistemi")
     st.caption("Streamlit + Twilio WhatsApp")
@@ -285,8 +307,10 @@ def ui_new_checkup_section():
         phone = st.text_input("Telefon (+90...)")
         pkg = st.text_input("Paket Adı", value="Standart")
         cdate = st.date_input("Tarih", value=date.today())
-        tasks_text = st.text_area("Görevler (her satıra bir)", value="Kan Tahlili\nEKG\nRadyoloji (Akciğer)\nVücut Analizi\nSon Doktor Değerlendirmesi")
-
+        tasks_text = st.text_area(
+            "Görevler (her satıra bir)",
+            value="Kan Tahlili\nEKG\nRadyoloji (Akciğer)\nVücut Analizi\nSon Doktor Değerlendirmesi"
+        )
         submitted = st.form_submit_button("Kaydı Oluştur")
         if submitted:
             if not (name and phone and pkg and cdate):
@@ -303,7 +327,6 @@ def ui_today_board():
     if not rows:
         st.info("Bugün için kayıt yok.")
         return
-
     for r in rows:
         with st.expander(f"{r['name']} • {r['package_name']} • {r['check_date']} • {r['phone']}"):
             tasks = list_tasks_for_checkup(r["checkup_id"])
@@ -359,5 +382,5 @@ def main():
     ui_messages_log()
 
 if __name__ == "__main__":
-    # Streamlit ile çalıştırın: streamlit run app.py
+    # Çalıştır: streamlit run app.py
     pass
