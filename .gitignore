@@ -1,4 +1,12 @@
+# Python
 __pycache__/
 *.pyc
-checkup_tracker.db
+*.pyo
+*.pyd
+.venv/
+
+# SQLite DB
+checkup.db
+
+# Streamlit secrets (keep local)
 .streamlit/secrets.toml
