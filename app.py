@@ -4,6 +4,7 @@ from datetime import datetime
 from contextlib import closing
 import streamlit as st
 
+# --- Ayarlar / Env ---
 DB_PATH = "checkup.db"
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
@@ -17,6 +18,7 @@ try:
 except Exception:
     _twilio_ok = False
 
+# --- DB ---
 def get_conn():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
@@ -51,12 +53,14 @@ def init_db():
         )""")
 init_db()
 
+# --- Utils ---
 def normalize_phone(p: str) -> str:
     return p.replace(" ", "").replace("-", "")
 
 def now():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+# --- CRUD ---
 def add_personnel(name: str, phone: str):
     phone = normalize_phone(phone)
     if not phone.startswith("+"):
@@ -135,6 +139,7 @@ def list_msg_logs(limit: int = 50):
         ORDER BY m.id DESC LIMIT ?""", (limit,))
         return c.fetchall()
 
+# --- Auth ---
 def require_login():
     if "auth" not in st.session_state:
         st.session_state.auth = {"logged_in": False, "is_admin": False, "username": ""}
@@ -153,27 +158,31 @@ def require_login():
                 st.error("Geçersiz kullanıcı adı/parola.")
         st.stop()
 
+# --- UI ---
 st.set_page_config(page_title="Check-up Takip Sistemi", page_icon="✅", layout="wide")
 st.title("✅ Check-up Takip Sistemi")
-st.caption("Sadece personele WhatsApp • Admin personel ekleme • Tetkik Tamamla / Geri Al")
+st.caption("Sadece personele WhatsApp • Admin’e özel personel ekle • Tetkik Tamamla / Geri Al (undo)")
 require_login()
 
 with st.sidebar:
     st.markdown(f"**Kullanıcı:** {st.session_state.auth['username']}")
-    st.markdown("**Rol:** Admin")
+    st.markdown(f"**Rol:** {'Admin' if st.session_state.auth['is_admin'] else 'Kullanıcı'}")
     if st.button("🚪 Çıkış Yap"):
         st.session_state.auth = {"logged_in": False, "is_admin": False, "username": ""}
         st.rerun()
     st.divider()
-    st.markdown("**Durum**")
-    st.write("Twilio:", "✅" if _twilio_ok else "⚠️ Yüklü değil")
+    st.markdown("**Sistem Durumu**")
+    st.write("Twilio:", "✅ Hazır" if _twilio_ok else "⚠️ Yüklü değil")
     if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_WHATSAPP_FROM):
         st.warning("Ortam değişkenlerini ayarlayın: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_FROM")
     else:
         st.success("Twilio ayarları tamam.")
 
-tab_personel, tab_tetkik, tab_mesaj, tab_kayit = st.tabs(["👥 Personel", "🧪 Tetkik", "📲 WhatsApp", "🧾 Kayıtlar"])
+tab_personel, tab_tetkik, tab_mesaj, tab_kayit = st.tabs(
+    ["👥 Personel", "🧪 Tetkik Takibi", "📲 WhatsApp Mesaj", "🧾 Mesaj Kayıtları"]
+)
 
+# --- PERSONEL ---
 with tab_personel:
     st.subheader("👥 Personel Listesi")
     rows = list_personnel(active_only=False)
@@ -183,7 +192,7 @@ with tab_personel:
             use_container_width=True
         )
     else:
-        st.info("Kayıtlı personel yok.")
+        st.info("Kayıtlı personel bulunamadı.")
 
     st.divider()
     st.markdown("### ➕ Admin: Personel Ekle")
@@ -197,29 +206,30 @@ with tab_personel:
                 st.warning("Ad ve telefon zorunludur.")
             else:
                 add_personnel(ad, tel)
-                st.success(f"Eklendi: {ad}")
+                st.success(f"Personel eklendi: {ad}")
                 st.rerun()
         except Exception as e:
-            st.error(f"Hata: {e}")
+            st.error(f"Personel eklenemedi: {e}")
 
     st.markdown("### 🗑️ Admin: Personel Sil")
-    all_people = list_personnel(active_only=False)
-    if all_people:
-        choice = st.selectbox(
+    all_active = list_personnel(active_only=False)
+    if all_active:
+        sec = st.selectbox(
             "Silinecek personel",
-            options=[(r[0], f"{r[1]} ({r[2]})") for r in all_people],
+            options=[(r[0], f"{r[1]} ({r[2]})") for r in all_active],
             format_func=lambda x: x[1] if isinstance(x, tuple) else x
         )
         if st.button("Sil", type="primary"):
             try:
-                delete_personnel(choice[0])
-                st.success("Personel ve ilişkili kayıtlar silindi.")
+                delete_personnel(sec[0])
+                st.success("Personel ve ilgili kayıtlar silindi.")
                 st.rerun()
             except Exception as e:
                 st.error(f"Silme hatası: {e}")
     else:
         st.caption("Silinecek personel yok.")
 
+# --- TETKIK ---
 with tab_tetkik:
     st.subheader("🧪 Tetkik Takibi (Tamamla / Geri Al)")
     plist = list_personnel(active_only=True)
@@ -243,15 +253,11 @@ with tab_tetkik:
                     st.success("Tetkik eklendi.")
                     st.rerun()
                 except Exception as e:
-                    st.error(f"Hata: {e}")
+                    st.error(f"Eklenemedi: {e}")
 
         st.markdown("#### Tetkikler")
         filt = st.selectbox("Duruma göre filtrele", ["Tümü", "Bekliyor", "Tamamlandı"])
-        status_filter = None
-        if filt == "Bekliyor":
-            status_filter = "bekliyor"
-        elif filt == "Tamamlandı":
-            status_filter = "tamamlandi"
+        status_filter = {"Tümü": None, "Bekliyor": "bekliyor", "Tamamlandı": "tamamlandi"}[filt]
         trs = get_tests(personnel_id=selected_pid, status=status_filter)
 
         if not trs:
@@ -263,28 +269,31 @@ with tab_tetkik:
                     st.write(f"**{test_name}** — {pname}")
                     st.caption(f"Durum: {'✅ Tamamlandı' if status=='tamamlandi' else '⏳ Bekliyor'} • Güncelleme: {updated_at}")
                 with cols[1]:
-                    if status == "bekliyor" and st.button("Tamamla", key=f"done_{tid}"):
-                        try:
-                            update_test_status(tid, "tamamlandi")
-                            st.success("Tetkik tamamlandı.")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Hata: {e}")
+                    if status == "bekliyor":
+                        if st.button("Tamamla", key=f"done_{tid}"):
+                            try:
+                                update_test_status(tid, "tamamlandi")
+                                st.success("Tetkik tamamlandı olarak işaretlendi.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Hata: {e}")
                 with cols[2]:
-                    if status == "tamamlandi" and st.button("Geri Al", key=f"undo_{tid}"):
-                        try:
-                            update_test_status(tid, "bekliyor")
-                            st.info("Geri alındı (Bekliyor).")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Hata: {e}")
+                    if status == "tamamlandi":
+                        if st.button("Geri Al", key=f"undo_{tid}"):
+                            try:
+                                update_test_status(tid, "bekliyor")
+                                st.info("Tetkik durumu geri alındı (Bekliyor).")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Hata: {e}")
                 with cols[3]:
                     st.empty()
 
+# --- MESAJ ---
 with tab_mesaj:
     st.subheader("📲 WhatsApp Mesaj Gönder (Sadece Personel)")
     if not _twilio_ok:
-        st.warning("Twilio paketi yüklü değil. Terminal: pip install twilio")
+        st.warning("Twilio paketi yüklü değil. Terminal:  pip install twilio")
     active_personnel = list_personnel(active_only=True)
     if not active_personnel:
         st.info("Önce personel ekleyin.")
@@ -294,11 +303,21 @@ with tab_mesaj:
             options=[(p[0], f"{p[1]} — {p[2]}") for p in active_personnel],
             format_func=lambda x: x[1] if isinstance(x, tuple) else x
         )
-        st.caption("Mesajda {ad} değişkenini kullanabilirsiniz.")
-        default_msg = "Merhaba {ad}, Check-up süreç bilgilendirmesidir."
+        st.caption("İpucu: Mesajda {ad} değişkenini kullanabilirsin.")
+        default_msg = "Merhaba {ad}, Check-up süreç bilgilendirmesidir. Detaylar için dönüş yapabilirsiniz."
         msg = st.text_area("Mesaj", value=default_msg, height=120)
 
-        if st.button("Gönder", type="primary", disabled=len(multi)==0):
+        colg = st.columns([1,1,5])
+        with colg[0]:
+            send_btn = st.button("Gönder", type="primary", disabled=len(multi)==0)
+        with colg[1]:
+            clear_btn = st.button("Seçimleri Temizle")
+
+        if clear_btn:
+            st.session_state.pop("multiselect", None)
+            st.rerun()
+
+        if send_btn:
             sent_ok, sent_err = 0, 0
             for (pid, _) in multi:
                 person = [p for p in active_personnel if p[0] == pid][0]
@@ -308,13 +327,14 @@ with tab_mesaj:
                 log_message(pid, body, ok, info)
                 sent_ok += 1 if ok else 0
                 sent_err += 0 if ok else 1
-            if sent_ok and not sent_err:
-                st.success(f"{sent_ok} kişiye gönderildi.")
+            if sent_ok and sent_err == 0:
+                st.success(f"Toplam {sent_ok} kişiye gönderildi.")
             elif sent_ok and sent_err:
                 st.warning(f"{sent_ok} başarılı, {sent_err} hatalı.")
             else:
                 st.error("Gönderim başarısız. Ayarları kontrol edin.")
 
+# --- KAYIT ---
 with tab_kayit:
     st.subheader("🧾 Son Mesaj Kayıtları")
     logs = list_msg_logs(limit=100)
@@ -322,6 +342,7 @@ with tab_kayit:
         st.info("Henüz kayıt yok.")
     else:
         st.dataframe(
-            [{"Zaman": r[0], "Ad Soyad": r[1], "Telefon": r[2], "Sonuç": "✅" if r[3]=='ok' else "❌", "Bilgi": r[4], "İleti": r[5]} for r in logs],
+            [{"Zaman": r[0], "Ad Soyad": r[1], "Telefon": r[2],
+              "Sonuç": "✅" if r[3]=='ok' else "❌", "Bilgi": r[4], "İleti": r[5]} for r in logs],
             use_container_width=True
         )
