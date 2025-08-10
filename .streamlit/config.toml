@@ -1,0 +1,3 @@
+# .streamlit/config.toml
+[server]
+fileWatcherType = "none"   # Cloud'da watchdog'u kapatır, inotify limit hatasını çözer
