@@ -1,8 +1,9 @@
 import os, sqlite3
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from contextlib import closing
 import streamlit as st
 
+# ----------------- Ayarlar / Env -----------------
 DB_PATH = "checkup.db"
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
@@ -16,45 +17,72 @@ try:
 except Exception:
     _twilio_ok = False
 
+# ----------------- DB Yardımcıları -----------------
 def get_conn():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
+def column_exists(conn, table, column):
+    with closing(conn.cursor()) as c:
+        c.execute(f"PRAGMA table_info({table})")
+        return any(row[1] == column for row in c.fetchall())
+
 def init_db():
     with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
+        # Personel (sadece personele WhatsApp)
         c.execute("""CREATE TABLE IF NOT EXISTS personnel(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
             phone TEXT NOT NULL UNIQUE,
             active INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL)""")
+
+        # Hastalar (ziyaret günü ile)
         c.execute("""CREATE TABLE IF NOT EXISTS patients(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             first_name TEXT NOT NULL,
             last_name TEXT NOT NULL,
             age INTEGER,
             gender TEXT CHECK(gender IN ('Kadın','Erkek','Diğer')) DEFAULT 'Diğer',
+            visit_date TEXT NOT NULL,
             created_at TEXT NOT NULL)""")
+
+        # Eski tabloda visit_date yoksa ekle (yükseltme)
+        if not column_exists(conn, "patients", "visit_date"):
+            c.execute("ALTER TABLE patients ADD COLUMN visit_date TEXT")
+            # Eski kayıtlar için bugün atansın
+            c.execute("UPDATE patients SET visit_date = ?", (today_str(),))
+
+        # Hasta tetkikleri
         c.execute("""CREATE TABLE IF NOT EXISTS patient_tests(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             patient_id INTEGER NOT NULL,
             test_name TEXT NOT NULL,
-            status TEXT NOT NULL,        -- bekliyor | tamamlandi
+            status TEXT NOT NULL,   -- bekliyor | tamamlandi
             updated_at TEXT NOT NULL,
             FOREIGN KEY (patient_id) REFERENCES patients(id))""")
+
+        # Mesaj logları (personel)
         c.execute("""CREATE TABLE IF NOT EXISTS msg_logs(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             personnel_id INTEGER NOT NULL,
             body TEXT NOT NULL,
-            result TEXT NOT NULL,        -- ok | hata
+            result TEXT NOT NULL,   -- ok | hata
             info TEXT,
             created_at TEXT NOT NULL,
             FOREIGN KEY (personnel_id) REFERENCES personnel(id))""")
 init_db()
 
-def now(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+# ----------------- Util -----------------
+def now_str(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def today_str(d:date|None=None): 
+    return (d or date.today()).strftime("%Y-%m-%d")
 def normalize_phone(p:str)->str: return p.replace(" ","").replace("-","")
 
-# --- Personnel (for WhatsApp to staff only) ---
+def date_range(center:date, days:int=7):
+    start = center - timedelta(days=days)
+    return [start + timedelta(days=i) for i in range(days*2+1)]
+
+# ----------------- Personnel CRUD -----------------
 def list_personnel(active_only=True):
     with closing(get_conn()) as conn, closing(conn.cursor()) as c:
         q = "SELECT id,name,phone,active FROM personnel"
@@ -69,37 +97,46 @@ def add_personnel(name:str, phone:str):
         raise ValueError("Telefon numarası + ile başlamalı (ör. +90...)")
     with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
         c.execute("INSERT INTO personnel(name,phone,created_at) VALUES(?,?,?)",
-                  (name.strip(), phone.strip(), now()))
+                  (name.strip(), phone.strip(), now_str()))
 
 def delete_personnel(personnel_id:int):
     with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
         c.execute("DELETE FROM personnel WHERE id=?", (personnel_id,))
         c.execute("DELETE FROM msg_logs WHERE personnel_id=?", (personnel_id,))
 
-# --- Patients ---
-def add_patient(first_name:str,last_name:str,age:int|None,gender:str):
+# ----------------- Patients CRUD -----------------
+def add_patient(first_name:str,last_name:str,age:int|None,gender:str,visit_date:str):
     with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
-        c.execute("INSERT INTO patients(first_name,last_name,age,gender,created_at) VALUES(?,?,?,?,?)",
-                  (first_name.strip(), last_name.strip(), age, gender, now()))
+        c.execute("""INSERT INTO patients(first_name,last_name,age,gender,visit_date,created_at)
+                     VALUES(?,?,?,?,?,?)""",
+                  (first_name.strip(), last_name.strip(), age, gender, visit_date, now_str()))
 
 def delete_patient(patient_id:int):
     with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
         c.execute("DELETE FROM patient_tests WHERE patient_id=?", (patient_id,))
         c.execute("DELETE FROM patients WHERE id=?", (patient_id,))
 
-def list_patients():
+def list_patients(visit_date:str|None=None):
     with closing(get_conn()) as conn, closing(conn.cursor()) as c:
-        c.execute("SELECT id, first_name, last_name, age, gender FROM patients ORDER BY last_name, first_name")
+        if visit_date:
+            c.execute("""SELECT id, first_name, last_name, age, gender, visit_date
+                         FROM patients WHERE visit_date=? ORDER BY last_name, first_name""",
+                      (visit_date,))
+        else:
+            c.execute("""SELECT id, first_name, last_name, age, gender, visit_date
+                         FROM patients ORDER BY visit_date DESC, last_name, first_name""")
         return c.fetchall()
 
-# --- Patient Tests ---
+# ----------------- Patient Tests -----------------
 def add_patient_test(patient_id:int, test_name:str):
     with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
-        c.execute("INSERT INTO patient_tests(patient_id,test_name,status,updated_at) VALUES(?,?,?,?)",
-                  (patient_id, test_name.strip(), "bekliyor", now()))
+        c.execute("""INSERT INTO patient_tests(patient_id,test_name,status,updated_at)
+                     VALUES(?,?,?,?)""",
+                  (patient_id, test_name.strip(), "bekliyor", now_str()))
 
 def list_patient_tests(patient_id:int|None=None, status:str|None=None):
-    q = ("SELECT t.id, t.patient_id, p.first_name, p.last_name, t.test_name, t.status, t.updated_at "
+    q = ("SELECT t.id, t.patient_id, p.first_name, p.last_name, p.visit_date, "
+         "t.test_name, t.status, t.updated_at "
          "FROM patient_tests t JOIN patients p ON p.id=t.patient_id")
     conds, params = [], []
     if patient_id: conds.append("t.patient_id=?"); params.append(patient_id)
@@ -107,16 +144,17 @@ def list_patient_tests(patient_id:int|None=None, status:str|None=None):
     if conds: q += " WHERE " + " AND ".join(conds)
     q += " ORDER BY t.updated_at DESC"
     with closing(get_conn()) as conn, closing(conn.cursor()) as c:
-        c.execute(q, tuple(params)); return c.fetchall()
+        c.execute(q, tuple(params))
+        return c.fetchall()
 
 def update_patient_test_status(test_id:int, new_status:str):
     if new_status not in ("bekliyor","tamamlandi"):
         raise ValueError("Geçersiz durum.")
     with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
         c.execute("UPDATE patient_tests SET status=?, updated_at=? WHERE id=?",
-                  (new_status, now(), test_id))
+                  (new_status, now_str(), test_id))
 
-# --- WhatsApp (to staff only) ---
+# ----------------- WhatsApp (Personel) -----------------
 def send_whatsapp_message(to_phone:str, body:str)->tuple[bool,str]:
     if not _twilio_ok: return False, "Twilio paketi yüklü değil."
     if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_WHATSAPP_FROM):
@@ -128,14 +166,15 @@ def send_whatsapp_message(to_phone:str, body:str)->tuple[bool,str]:
             to=f"whatsapp:{normalize_phone(to_phone)}",
             body=body
         )
-        return True, getattr(msg,"sid","ok")
+        return True, getattr(msg, "sid", "ok")
     except Exception as e:
         return False, str(e)
 
 def log_message(personnel_id:int, body:str, ok:bool, info:str):
     with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
-        c.execute("INSERT INTO msg_logs(personnel_id,body,result,info,created_at) VALUES(?,?,?,?,?)",
-                  (personnel_id, body, "ok" if ok else "hata", info[:500], now()))
+        c.execute("""INSERT INTO msg_logs(personnel_id,body,result,info,created_at)
+                     VALUES (?,?,?,?,?)""",
+                  (personnel_id, body, "ok" if ok else "hata", info[:500], now_str()))
 
 def list_msg_logs(limit:int=100):
     with closing(get_conn()) as conn, closing(conn.cursor()) as c:
@@ -144,7 +183,7 @@ def list_msg_logs(limit:int=100):
                      ORDER BY m.id DESC LIMIT ?""", (limit,))
         return c.fetchall()
 
-# --- Auth ---
+# ----------------- Auth -----------------
 def require_login():
     if "auth" not in st.session_state:
         st.session_state.auth = {"logged_in": False, "is_admin": False, "username": ""}
@@ -162,57 +201,64 @@ def require_login():
                     st.error("Geçersiz kullanıcı adı/parola.")
         st.stop()
 
-# --- UI ---
+# ----------------- UI -----------------
 st.set_page_config(page_title="Check-up Takip Sistemi", page_icon="✅", layout="wide")
 st.title("✅ Check-up Takip Sistemi")
-st.caption("Hasta check-up takibi • Tetkik Tamamla/Geri Al • WhatsApp yalnızca personele")
 require_login()
 
+# ---- Kaydırmalı Gün Seçimi (global filtre) ----
+st.sidebar.subheader("📅 Gün Seç")
+days = date_range(date.today(), days=7)  # bugün ±7 gün
+labels = [d.strftime("%d %b %Y (%a)") for d in days]
+default_idx = days.index(date.today()) if date.today() in days else 0
+sel_label = st.sidebar.select_slider("Gün", options=labels, value=labels[default_idx], key="day_slider")
+SELECTED_DATE = days[labels.index(sel_label)]
+st.sidebar.caption(f"Seçili gün: {SELECTED_DATE.strftime('%Y-%m-%d')}")
+
 with st.sidebar:
-    st.markdown(f"**Kullanıcı:** {st.session_state.auth['username']}")
-    st.markdown("**Rol:** Admin")
-    if st.button("🚪 Çıkış Yap"):
-        st.session_state.auth = {"logged_in": False, "is_admin": False, "username": ""}
-        st.rerun()
     st.divider()
     st.markdown("**Sistem**")
     st.write("Twilio:", "✅" if _twilio_ok else "⚠️ Yüklü değil")
     if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_WHATSAPP_FROM):
-        st.warning("Ortam değişkenleri: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_FROM")
+        st.warning("TWILIO_* ortam değişkenlerini ekleyin.")
     else:
         st.success("Twilio ayarları tamam.")
+    if st.button("🚪 Çıkış Yap", key="logout_btn"):
+        st.session_state.auth = {"logged_in": False, "is_admin": False, "username": ""}
+        st.rerun()
 
 tab_hasta, tab_tetkik, tab_mesaj, tab_kayit, tab_personel = st.tabs([
-    "🧑‍⚕️ Hastalar", "🧪 Tetkik Takibi", "📲 WhatsApp Mesaj (Personel)", "🧾 Mesaj Kayıtları", "👥 Personel"
+    "🧑‍⚕️ Hastalar (Güne Göre)", "🧪 Tetkik Takibi", "📲 WhatsApp Mesaj (Personel)", "🧾 Mesaj Kayıtları", "👥 Personel"
 ])
 
-# --- HASTALAR ---
+# ----------------- HASTALAR -----------------
 with tab_hasta:
-    st.subheader("🧑‍⚕️ Hasta Listesi")
-    pts = list_patients()
+    st.subheader(f"🧑‍⚕️ Hasta Listesi — {SELECTED_DATE.strftime('%Y-%m-%d')}")
+    pts = list_patients(visit_date=today_str(SELECTED_DATE))
     if pts:
         st.dataframe(
-            [{"ID":p[0], "Ad":p[1], "Soyad":p[2], "Yaş":p[3], "Cinsiyet":p[4]} for p in pts],
+            [{"ID":p[0], "Ad":p[1], "Soyad":p[2], "Yaş":p[3], "Cinsiyet":p[4], "Gün":p[5]} for p in pts],
             use_container_width=True
         )
     else:
-        st.info("Kayıtlı hasta yok.")
+        st.info("Bu gün için kayıtlı hasta yok.")
 
     st.divider()
-    st.markdown("### ➕ Hasta Ekle (minimal veri)")
+    st.markdown("### ➕ Hasta Ekle (seçili güne)")
     with st.form("hasta_ekle", clear_on_submit=True):
         col1, col2, col3, col4 = st.columns([2,2,1,1])
         with col1: fn = st.text_input("Ad")
         with col2: ln = st.text_input("Soyad")
         with col3: age = st.number_input("Yaş", min_value=0, max_value=120, value=0, step=1)
         with col4: gender = st.selectbox("Cinsiyet", ["Kadın","Erkek","Diğer"])
+        st.caption(f"Eklenecek gün: {SELECTED_DATE.strftime('%Y-%m-%d')}")
         add_ok = st.form_submit_button("Ekle")
     if add_ok:
         try:
             if not fn.strip() or not ln.strip():
                 st.warning("Ad ve Soyad zorunludur.")
             else:
-                add_patient(fn, ln, int(age) if age else None, gender)
+                add_patient(fn, ln, int(age) if age else None, gender, today_str(SELECTED_DATE))
                 st.success(f"Hasta eklendi: {fn} {ln}")
                 st.rerun()
         except Exception as e:
@@ -221,8 +267,8 @@ with tab_hasta:
     st.markdown("### 🗑️ Hasta Sil")
     if pts:
         sel = st.selectbox("Silinecek hasta", options=[(p[0], f"{p[1]} {p[2]} (#{p[0]})") for p in pts],
-                           format_func=lambda x: x[1] if isinstance(x, tuple) else x)
-        if st.button("Sil", type="primary"):
+                           format_func=lambda x: x[1] if isinstance(x, tuple) else x, key="hasta_sil_select")
+        if st.button("Sil", type="primary", key="hasta_sil_btn"):
             try:
                 delete_patient(sel[0])
                 st.success("Hasta ve tetkikleri silindi.")
@@ -232,15 +278,15 @@ with tab_hasta:
     else:
         st.caption("Silinecek hasta yok.")
 
-# --- TETKİK (HASTAYA BAĞLI) ---
+# ----------------- TETKİK (HASTAYA BAĞLI) -----------------
 with tab_tetkik:
-    st.subheader("🧪 Tetkik Takibi (Hasta Bazlı)")
-    pts = list_patients()
-    if not pts:
-        st.warning("Önce hasta ekleyin.")
+    st.subheader("🧪 Tetkik Takibi (Seçili güne ait hastalar)")
+    pts_today = list_patients(visit_date=today_str(SELECTED_DATE))
+    if not pts_today:
+        st.warning("Önce bu gün için en az bir hasta ekleyin.")
     else:
-        pmap = {f"{p[1]} {p[2]} — (#{p[0]})": p[0] for p in pts}
-        sel_name = st.selectbox("Hasta seç", list(pmap.keys()))
+        pmap = {f"{p[1]} {p[2]} — (#{p[0]})": p[0] for p in pts_today}
+        sel_name = st.selectbox("Hasta seç", list(pmap.keys()), key="tetkik_hasta_select")
         pid = pmap[sel_name]
 
         st.markdown("#### Tetkik Ekle")
@@ -259,16 +305,16 @@ with tab_tetkik:
                     st.error(f"Hata: {e}")
 
         st.markdown("#### Tetkikler")
-        filt = st.selectbox("Durum", ["Tümü","Bekliyor","Tamamlandı"])
+        filt = st.selectbox("Durum", ["Tümü","Bekliyor","Tamamlandı"], key="tetkik_filter")
         status = {"Tümü":None,"Bekliyor":"bekliyor","Tamamlandı":"tamamlandi"}[filt]
         trs = list_patient_tests(patient_id=pid, status=status)
         if not trs:
             st.info("Kayıt yok.")
         else:
-            for (tid, _pid, fn, ln, test_name, status, updated_at) in trs:
+            for (tid, _pid, fn, ln, vdate, test_name, status, updated_at) in trs:
                 c = st.columns([5,2,2,3])
                 with c[0]:
-                    st.write(f"**{test_name}** — {fn} {ln}")
+                    st.write(f"**{test_name}** — {fn} {ln} • {vdate}")
                     st.caption(f"Durum: {'✅ Tamamlandı' if status=='tamamlandi' else '⏳ Bekliyor'} • Güncelleme: {updated_at}")
                 with c[1]:
                     if status == "bekliyor" and st.button("Tamamla", key=f"done_{tid}"):
@@ -289,7 +335,7 @@ with tab_tetkik:
                 with c[3]:
                     st.empty()
 
-# --- WHATSAPP (PERSONEL) ---
+# ----------------- WHATSAPP (PERSONEL) -----------------
 with tab_mesaj:
     st.subheader("📲 WhatsApp Mesaj Gönder (Sadece Personel)")
     if not _twilio_ok:
@@ -306,7 +352,7 @@ with tab_mesaj:
         st.caption("Mesajda {ad} değişkenini kullanabilirsiniz (ör. 'Merhaba {ad}').")
         default_msg = "Merhaba {ad}, Check-up süreç bilgilendirmesidir."
         msg = st.text_area("Mesaj", value=default_msg, height=120)
-        if st.button("Gönder", type="primary", disabled=len(multi)==0):
+        if st.button("Gönder", type="primary", disabled=len(multi)==0, key="wp_send_btn"):
             okc, errc = 0, 0
             for (pid, _) in multi:
                 person = [p for p in staff if p[0]==pid][0]
@@ -320,7 +366,7 @@ with tab_mesaj:
             elif okc and errc:   st.warning(f"{okc} başarılı, {errc} hatalı.")
             else:                st.error("Gönderim başarısız. Ayarları kontrol edin.")
 
-# --- MESAJ KAYITLARI ---
+# ----------------- MESAJ KAYITLARI -----------------
 with tab_kayit:
     st.subheader("🧾 Son Mesaj Kayıtları (Personel)")
     logs = list_msg_logs(limit=100)
@@ -333,7 +379,7 @@ with tab_kayit:
             use_container_width=True
         )
 
-# --- PERSONEL (YÖNETİM) ---
+# ----------------- PERSONEL -----------------
 with tab_personel:
     st.subheader("👥 Personel Listesi")
     rows = list_personnel(active_only=False)
@@ -367,8 +413,9 @@ with tab_personel:
     if all_people:
         choice = st.selectbox("Silinecek personel",
                               options=[(r[0], f"{r[1]} ({r[2]})") for r in all_people],
-                              format_func=lambda x: x[1] if isinstance(x, tuple) else x)
-        if st.button("Sil", type="primary"):
+                              format_func=lambda x: x[1] if isinstance(x, tuple) else x,
+                              key="personel_sil_select")
+        if st.button("Sil", type="primary", key="personel_sil_btn"):
             try:
                 delete_personnel(choice[0])
                 st.success("Personel ve ilişkili mesaj kayıtları silindi.")
