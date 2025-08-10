@@ -1,7 +1,6 @@
-
 streamlit>=1.33
 fastapi>=0.110
 uvicorn>=0.29
 twilio>=9.0
 pydantic>=2.6
-# python-dotenv not required because we use st.secrets
+python-multipart>=0.0.9
