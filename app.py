@@ -1,4 +1,4 @@
-# app.py — Güncellenmiş sürüm
+# app.py — Sadece personele mesaj gönderir
 import os
 import time
 from datetime import date
@@ -69,7 +69,8 @@ def db_init_safe():
                 CREATE TABLE IF NOT EXISTS patients (
                     id SERIAL PRIMARY KEY,
                     name TEXT NOT NULL,
-                    phone TEXT NOT NULL UNIQUE
+                    pkg TEXT NOT NULL,
+                    cdate DATE NOT NULL
                 );
             """)
             return True
@@ -89,10 +90,9 @@ if "records" not in st.session_state:
     st.session_state.records = []
 
 # ---- WhatsApp gönderim fonksiyonu ----
-def send_whatsapp(to_number: str, body: str):
+def send_whatsapp_to_staff(body: str):
     try:
-        if not to_number.startswith("whatsapp:"):
-            to_number = f"whatsapp:{to_number}"
+        to_number = f"whatsapp:{STAFF_TO}" if not STAFF_TO.startswith("whatsapp:") else STAFF_TO
         client = Client(TWILIO_SID, TWILIO_TOKEN)
         client.messages.create(from_=TWILIO_FROM, to=to_number, body=body)
         return True, None
@@ -100,25 +100,24 @@ def send_whatsapp(to_number: str, body: str):
         return False, str(e)
 
 # ---- UI ----
-st.title("✅ Check-up Takip")
-st.caption("Hasta / Personel mesaj gönderimi ve görev takibi")
+st.title("✅ Check-up Takip (Sadece Personel Mesajı)")
+st.caption("Hasta numarası alınmaz, tüm bildirimler personele gider.")
 
 # Yeni kayıt formu
 st.subheader("📝 Yeni Check-up Kaydı")
 with st.form("new"):
     name  = st.text_input("Ad Soyad")
-    phone = st.text_input("Telefon (+90...)")
     pkg   = st.text_input("Paket", value="Standart")
     cdate = st.date_input("Tarih", value=date.today())
     tasks_raw = st.text_area("Görevler (her satır bir görev)",
                              "Kan Tahlili\nEKG\nRadyoloji (Akciğer)\nVücut Analizi\nSon Doktor Değerlendirmesi")
     if st.form_submit_button("Kaydı Ekle"):
-        if not (name and phone):
-            st.warning("Ad ve telefon zorunlu.")
+        if not name:
+            st.warning("Ad zorunlu.")
         else:
             tasks = [{"title": t.strip(), "done": False} for t in tasks_raw.splitlines() if t.strip()]
             st.session_state.records.append({
-                "name": name, "phone": phone, "pkg": pkg, "cdate": cdate, "tasks": tasks
+                "name": name, "pkg": pkg, "cdate": cdate, "tasks": tasks
             })
             st.success(f"Kayıt eklendi: {name} • {pkg} • {cdate}")
 
@@ -130,7 +129,7 @@ else:
     for idx, rec in enumerate(st.session_state.records):
         pending = [t for t in rec["tasks"] if not t["done"]]
         done    = [t for t in rec["tasks"] if t["done"]]
-        with st.expander(f"{rec['name']} • {rec['pkg']} • {rec['cdate']} • {rec['phone']}"):
+        with st.expander(f"{rec['name']} • {rec['pkg']} • {rec['cdate']}"):
             # görevler
             for j, t in enumerate(rec["tasks"]):
                 col1, col2 = st.columns([6,2])
@@ -141,23 +140,17 @@ else:
                         t["done"] = True
                         st.rerun()
 
-            # WhatsApp gönderim
-            st.markdown("### 📲 Mesaj Gönder")
-            kime = st.radio("Mesaj alıcısı", ["Hasta", "Personel"], horizontal=True, key=f"who_{idx}")
-            if kime == "Hasta":
-                to_num = rec["phone"]
-            else:
-                to_num = STAFF_TO or st.text_input("Personel numarası (+90...)", key=f"staff_{idx}")
-            if st.button("Durumu WhatsApp ile Gönder", key=f"msg_{idx}"):
-                body = "Check-up Durumunuz:\n"
+            # WhatsApp gönderim (sadece personele)
+            if st.button("Durumu Personele WhatsApp ile Gönder", key=f"msg_{idx}"):
+                body = f"Check-up Durumu ({rec['name']} - {rec['pkg']} - {rec['cdate']}):\n"
                 body += "- Bekleyen: " + (", ".join([t['title'] for t in pending]) if pending else "Yok") + "\n"
-                body += "- Tamamlanan: " + (", ".join([t['title'] for t in done   ]) if done    else "Yok")
-                ok, err = send_whatsapp(to_num, body)
+                body += "- Tamamlanan: " + (", ".join([t['title'] for t in done]) if done else "Yok")
+                ok, err = send_whatsapp_to_staff(body)
                 if ok:
-                    st.success("WhatsApp gönderildi.")
+                    st.success("Personel WhatsApp mesajı gönderildi.")
                 else:
                     st.error("Gönderilemedi.")
                     if DEBUG: st.caption(err)
 
 st.divider()
-st.caption("Versiyon 2.0 — DB güvenli başlatma + Mesaj alıcı seçimi + Debug temizliği")
+st.caption("Versiyon 2.1 — Hasta numarası yok, sadece personele mesaj gönderilir.")
