@@ -300,7 +300,7 @@ with tab_hasta:
         ln = c2.text_input("Soyad")
         age = c3.number_input("Yaş", 0, 120, 0, 1)
         gender = st.selectbox("Cinsiyet", ["Kadın","Erkek","Diğer"])
-        if st.form_submit_button("Ekle", key="btn_add_patient"):
+        if st.form_submit_button("Ekle"):
             if not fn.strip() or not ln.strip():
                 st.warning("Ad ve Soyad zorunludur.")
             else:
@@ -334,7 +334,7 @@ with tab_tetkik:
                 hour = colh.selectbox("Saat", [f"{h:02d}" for h in range(24)], key="alarm_hour")
                 minute = colm.selectbox("Dakika", [f"{m:02d}" for m in range(0,60,5)], key="alarm_min")
                 hhmm = f"{hour}:{minute}"
-            addt = st.form_submit_button("Ekle", key="btn_add_test")
+            addt = st.form_submit_button("Ekle")
         if addt:
             if not tname.strip():
                 st.warning("Tetkik adı zorunlu.")
