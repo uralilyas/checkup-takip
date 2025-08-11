@@ -9,8 +9,8 @@ st.set_page_config(page_title="Check-up Takip", page_icon="✅", layout="wide")
 DB_PATH = "checkup.db"
 TZ = "Europe/Istanbul"  # bilgilendirme amaçlı; sistem saatini kullanıyoruz
 
-# ---- Ortam değişkenleri ----
-# Streamlit Cloud'da "Secrets" üzerinden geliyorsa önce oradan, yoksa ortam değişkeninden oku
+# ================== SECRET / ENV HELPERS ==================
+# Streamlit Cloud'da "Secrets" kullanıyorsan önce oradan, yoksa ortam değişkeninden oku.
 
 def _get_secret_or_env(key: str, default: str = "") -> str:
     try:
@@ -22,22 +22,14 @@ def _get_secret_or_env(key: str, default: str = "") -> str:
         pass
     return str(os.environ.get(key, default) or "").strip()
 
-def _source_of(key: str) -> str:
-    try:
-        if hasattr(st, "secrets") and key in st.secrets and str(st.secrets.get(key) or "").strip() != "":
-            return "secrets"
-    except Exception:
-        pass
-    if os.environ.get(key):
-        return "env"
-    return "default"
-
+# Twilio konfigürasyonu (opsiyonel)
 TWILIO_ACCOUNT_SID = _get_secret_or_env("TWILIO_ACCOUNT_SID", "")
-TWILIO_AUTH_TOKEN = _get_secret_or_env("TWILIO_AUTH_TOKEN", "")
+TWILIO_AUTH_TOKEN  = _get_secret_or_env("TWILIO_AUTH_TOKEN",  "")
 TWILIO_WHATSAPP_FROM = _get_secret_or_env("TWILIO_WHATSAPP_FROM", "")  # +1415... ya da whatsapp:+1415...
 
-ADMIN_USER = _get_secret_or_env("ADMIN_USER", "admin")
-ADMIN_PASS = _get_secret_or_env("ADMIN_PASS", "admin123")
+# Admin kimlik doğrulama – çoklu isim desteği (secrets/env) + DB fallback
+ADMIN_USER_DEFAULT = _get_secret_or_env("ADMIN_USER", _get_secret_or_env("ADMIN_USERNAME", _get_secret_or_env("USERNAME", "admin")))
+ADMIN_PASS_DEFAULT = _get_secret_or_env("ADMIN_PASS", _get_secret_or_env("ADMIN_PASSWORD", _get_secret_or_env("PASSWORD", "admin123")))
 
 try:
     from twilio.rest import Client
@@ -102,12 +94,21 @@ def init_db():
             FOREIGN KEY (personnel_id) REFERENCES personnel(id)
         )""")
 
-        # Basit ayarlar (tema, özet saati, şablonlar...)
+        # Basit ayarlar (tema, özet saati, şablonlar, admin bilgileri...)
         c.execute("""CREATE TABLE IF NOT EXISTS app_settings(
             key TEXT PRIMARY KEY,
             val TEXT
         )""")
 init_db()
+
+# İlk çalışmada (veya secrets/env yoksa) admin bilgilerini DB'ye kaydet
+with closing(get_conn()) as _conn, _conn, closing(_conn.cursor()) as _c:
+    _c.execute("SELECT val FROM app_settings WHERE key='admin_user'")
+    if not _c.fetchone():
+        _c.execute("INSERT OR REPLACE INTO app_settings(key,val) VALUES('admin_user',?)", (ADMIN_USER_DEFAULT,))
+    _c.execute("SELECT val FROM app_settings WHERE key='admin_pass'")
+    if not _c.fetchone():
+        _c.execute("INSERT OR REPLACE INTO app_settings(key,val) VALUES('admin_pass',?)", (ADMIN_PASS_DEFAULT,))
 
 # ================== UTILS ==================
 def now_str(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -120,13 +121,15 @@ def normalize_phone(p: str) -> str:
         p = "+" + p
     return p
 
-# Twilio from
+# Twilio "from" formatlayıcı
 
 def _wa_from() -> str:
-    f = (os.environ.get("TWILIO_WHATSAPP_FROM", TWILIO_WHATSAPP_FROM) or "").strip()
+    f = _get_secret_or_env("TWILIO_WHATSAPP_FROM", TWILIO_WHATSAPP_FROM).strip()
+    if not f:
+        return ""
     if f.startswith("whatsapp:"):
         return f
-    f = normalize_phone(f) if f else ""
+    f = normalize_phone(f)
     return f"whatsapp:{f}" if f else ""
 
 # ---- Settings helpers ----
@@ -233,12 +236,13 @@ def delete_patient_test(test_id:int):
 def send_whatsapp_message(to_phone:str, body:str)->tuple[bool,str]:
     if not _twilio_ok:
         return False, "Twilio paketi yok"
-    if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and (TWILIO_WHATSAPP_FROM or _wa_from())):
+    from_addr = _wa_from()
+    if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and from_addr):
         return False, "Twilio ortam değişkenleri eksik"
     try:
         client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
         msg = client.messages.create(
-            from_=_wa_from(),
+            from_=from_addr,
             to=f"whatsapp:{normalize_phone(to_phone)}",
             body=body
         )
@@ -413,6 +417,15 @@ section[data-testid="stSidebar"] * { -webkit-font-smoothing: antialiased; }
 </style>
 """, unsafe_allow_html=True)
 
+# ================== AUTH HELPERS ==================
+def _get_admin_creds():
+    """Öncelik: DB (app_settings) > secrets/env (çeşitli anahtarlar) > varsayılanlar."""
+    u_db = get_setting("admin_user", "")
+    p_db = get_setting("admin_pass", "")
+    if u_db and p_db:
+        return u_db.strip(), p_db.strip()
+    return ADMIN_USER_DEFAULT.strip(), ADMIN_PASS_DEFAULT.strip()
+
 # ================== AUTH ==================
 if "auth" not in st.session_state:
     st.session_state.auth = {"logged_in": False, "is_admin": False, "username": None}
@@ -422,22 +435,17 @@ if not st.session_state.auth["logged_in"]:
     st.title("✅ Check-up Takip Sistemi")
     st.caption("Giriş yapın – bugün için yalnızca admin kullanıcı gereklidir.")
     with st.form("login_form"):
-        u = st.text_input("Kullanıcı adı", value="").strip()
-        p = st.text_input("Şifre", type="password", value="").strip()
+        u_in = st.text_input("Kullanıcı adı", value="").strip()
+        p_in = st.text_input("Şifre", type="password", value="").strip()
         submit = st.form_submit_button("Giriş")
     if submit:
-        if u == ADMIN_USER and p == ADMIN_PASS:
-            st.session_state.auth = {"logged_in": True, "is_admin": True, "username": u}
+        u_cfg, p_cfg = _get_admin_creds()
+        if u_in == u_cfg and p_in == p_cfg:
+            st.session_state.auth = {"logged_in": True, "is_admin": True, "username": u_in}
             st.success("Giriş başarılı.")
             st.rerun()
         else:
             st.error("Hatalı kullanıcı adı veya şifre.")
-    # Geçici debug: gizli değerleri ifşa etmeden kaynak/uzunluk göster
-    dbg = st.checkbox("🔧 Geliştirici modu (geçici)")
-    if dbg:
-        st.caption(f"ADMIN_USER kaynağı: {_source_of('ADMIN_USER')} | değer: '{ADMIN_USER}'")
-        st.caption(f"ADMIN_PASS kaynağı: {_source_of('ADMIN_PASS')} | uzunluk: {len(ADMIN_PASS) if ADMIN_PASS else 0}")
-        st.caption("Not: Parola içeriği gösterilmez; yalnızca uzunluk görüntülenir.")
     st.stop()
 
 # ================== APPLY THEME ==================
@@ -513,7 +521,7 @@ with st.sidebar:
         st.markdown("#### ➕ Numara Ekle")
         with st.form("frm_add_staff_quick", clear_on_submit=True):
             nm = st.text_input("Ad / not", key="nm_add_quick")
-            ph = st.text_input("Telefon (+90...)", key="ph_add_quick")
+            ph = st.text_input("Telefon (+90...)" , key="ph_add_quick")
             act = st.checkbox("Mesaj alsın (Aktif)", value=True, key="ph_add_active")
             submit_add = st.form_submit_button("Ekle")
         if submit_add:
@@ -555,6 +563,27 @@ with st.sidebar:
                 st.success(f"OK: {info}")
             else:
                 st.error(f"Hata: {info}")
+
+        st.divider()
+        st.markdown("#### 🔐 Admin Şifre Değiştir")
+        with st.form("frm_change_admin"):
+            cur = st.text_input("Mevcut şifre", type="password")
+            new_user = st.text_input("Yeni kullanıcı adı", value=get_setting("admin_user", ""))
+            new1 = st.text_input("Yeni şifre", type="password")
+            new2 = st.text_input("Yeni şifre (tekrar)", type="password")
+            submit_ch = st.form_submit_button("Güncelle")
+        if submit_ch:
+            u_cfg, p_cfg = _get_admin_creds()
+            if cur != p_cfg:
+                st.error("Mevcut şifre yanlış.")
+            elif not new_user.strip() or not new1:
+                st.error("Kullanıcı adı/şifre boş olamaz.")
+            elif new1 != new2:
+                st.error("Yeni şifreler uyuşmuyor.")
+            else:
+                set_setting("admin_user", new_user.strip())
+                set_setting("admin_pass", new1)
+                st.success("Admin bilgileri güncellendi. Lütfen çıkış yapıp yeni bilgilerle giriş yapın.")
 
 # =============== ZAMANLAYICI BAŞLAT ===============
 if "bg_threads_started" not in st.session_state:
