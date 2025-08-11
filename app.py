@@ -5,10 +5,13 @@ from contextlib import closing
 import streamlit as st
 
 # ================== CONFIG ==================
+st.set_page_config(page_title="Check-up Takip", page_icon="✅", layout="wide")
+
 DB_PATH = "checkup.db"
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
-TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM", "")
+TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM", "")  # +14155238886 veya whatsapp:+14155238886 (sandbox)
+
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "changeme")
 
@@ -29,7 +32,6 @@ def column_exists(conn, table, column) -> bool:
 
 def init_db():
     with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
-        # staff who receive WhatsApp
         c.execute("""CREATE TABLE IF NOT EXISTS personnel(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
@@ -37,7 +39,6 @@ def init_db():
             active INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL
         )""")
-        # patients
         c.execute("""CREATE TABLE IF NOT EXISTS patients(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             first_name TEXT NOT NULL,
@@ -51,8 +52,7 @@ def init_db():
             c.execute("ALTER TABLE patients ADD COLUMN department TEXT")
             c.execute("UPDATE patients SET department='Genel' WHERE department IS NULL")
         if not column_exists(conn, "patients", "visit_time"):
-            c.execute("ALTER TABLE patients ADD COLUMN visit_time TEXT")
-        # tests
+            c.execute("ALTER TABLE patients ADD COLUMN visit_time TEXT")  # HH:MM
         c.execute("""CREATE TABLE IF NOT EXISTS patient_tests(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             patient_id INTEGER NOT NULL,
@@ -61,7 +61,6 @@ def init_db():
             updated_at TEXT NOT NULL,
             FOREIGN KEY (patient_id) REFERENCES patients(id)
         )""")
-        # message logs
         c.execute("""CREATE TABLE IF NOT EXISTS msg_logs(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             personnel_id INTEGER NOT NULL,
@@ -71,7 +70,6 @@ def init_db():
             created_at TEXT NOT NULL,
             FOREIGN KEY (personnel_id) REFERENCES personnel(id)
         )""")
-        # users (for login/registration)
         c.execute("""CREATE TABLE IF NOT EXISTS users(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT NOT NULL UNIQUE,
@@ -86,15 +84,44 @@ def init_db():
             otp_expires TEXT,
             FOREIGN KEY (personnel_id) REFERENCES personnel(id)
         )""")
-
+        # basit ayarlar
+        c.execute("""CREATE TABLE IF NOT EXISTS app_settings(
+            key TEXT PRIMARY KEY,
+            val TEXT
+        )""")
 init_db()
 
 # ================== UTILS ==================
 def now_str(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 def to_iso(d:date) -> str: return d.strftime("%Y-%m-%d")
 def to_display(d:date) -> str: return d.strftime("%d/%m/%Y")
-def normalize_phone(p:str)->str: return p.replace(" ","").replace("-","")
-def hash_pw(pw:str)->str: return hashlib.sha256(pw.encode("utf-8")).hexdigest()
+
+def normalize_phone(p: str) -> str:
+    p = (p or "").strip().replace(" ", "").replace("-", "")
+    if p and not p.startswith("+"):
+        p = "+" + p
+    return p
+
+def _wa_from() -> str:
+    f = (os.environ.get("TWILIO_WHATSAPP_FROM", TWILIO_WHATSAPP_FROM) or "").strip()
+    if f.startswith("whatsapp:"):
+        return f
+    f = normalize_phone(f) if f else ""
+    return f"whatsapp:{f}" if f else ""
+
+def hash_pw(pw:str)->str: return hashlib.sha256((pw or "").encode("utf-8")).hexdigest()
+
+# ---- Settings helpers ----
+def get_setting(key:str, default:str=""):
+    with closing(get_conn()) as conn, closing(conn.cursor()) as c:
+        c.execute("SELECT val FROM app_settings WHERE key=?", (key,))
+        row = c.fetchone()
+    return row[0] if row else default
+
+def set_setting(key:str, val:str):
+    with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
+        c.execute("INSERT INTO app_settings(key,val) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET val=?",
+                  (key, val, val))
 
 # ================== PERSONNEL ==================
 def list_personnel(active_only=True):
@@ -107,8 +134,9 @@ def list_personnel(active_only=True):
 
 def upsert_personnel(name:str, phone:str, active:int)->int:
     phone = normalize_phone(phone)
+    if not phone.startswith("+"):
+        raise ValueError("Telefon + ile başlamalı (örn. +90...)")
     with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
-        # try find existing by phone
         c.execute("SELECT id FROM personnel WHERE phone=?", (phone,))
         row = c.fetchone()
         if row:
@@ -122,6 +150,11 @@ def upsert_personnel(name:str, phone:str, active:int)->int:
 def set_personnel_active(pid:int, active:int):
     with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
         c.execute("UPDATE personnel SET active=? WHERE id=?", (active, pid))
+
+def delete_personnel(pid:int):
+    with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
+        c.execute("DELETE FROM msg_logs WHERE personnel_id=?", (pid,))
+        c.execute("DELETE FROM personnel WHERE id=?", (pid,))
 
 # ================== PATIENTS ==================
 def add_patient(fn:str, ln:str, age:int, gender:str, visit_date_iso:str):
@@ -180,13 +213,14 @@ def delete_patient_test(test_id:int):
 
 # ================== MESSAGING (Twilio WhatsApp) ==================
 def send_whatsapp_message(to_phone:str, body:str)->tuple[bool,str]:
-    if not _twilio_ok: return False, "Twilio paketi yok"
-    if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_WHATSAPP_FROM):
+    if not _twilio_ok:
+        return False, "Twilio paketi yok"
+    if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and (TWILIO_WHATSAPP_FROM or _wa_from())):
         return False, "Twilio ortam değişkenleri eksik"
     try:
         client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
         msg = client.messages.create(
-            from_=TWILIO_WHATSAPP_FROM,
+            from_=_wa_from(),
             to=f"whatsapp:{normalize_phone(to_phone)}",
             body=body
         )
@@ -237,187 +271,126 @@ def check_alarms_loop():
                     log_message(staff[0], body, ok, info)
         time.sleep(60)
 
-# Start alarm thread once
 if "alarm_thread_started" not in st.session_state:
     threading.Thread(target=check_alarms_loop, daemon=True).start()
     st.session_state.alarm_thread_started = True
 
-# ================== AUTH & REGISTRATION ==================
-def hide_streamlit_chrome(hide: bool):
-    if not hide:  # admin için açık kalsın
-        return
-    css = """
-    <style>
-    header [data-testid="stToolbarActions"] {display:none !important;} /* Share/GitHub */
-    footer {visibility:hidden;}             /* Manage app */
-    [data-testid="stStatusWidget"]{display:none !important;} /* sağ alt simgeler */
-    </style>
-    """
-    st.markdown(css, unsafe_allow_html=True)
+# ================== THEME / UI POLISH ==================
+def apply_theme(theme_name: str):
+    THEMES = {
+        "Sistem (varsayılan)": "",
+        "Açık": """
+        <style>
+        body, .stApp { background: #f7f7f9!important; }
+        .stButton>button, .stDownloadButton>button { background:#2563eb!important; color:white!important; }
+        </style>""",
+        "Klinik (mint)": """
+        <style>
+        body, .stApp { background:#f4fffb!important; }
+        .stButton>button, .stDownloadButton>button { background:#10b981!important; color:white!important; }
+        </style>""",
+        "Yüksek Kontrast": """
+        <style>
+        body, .stApp { background:black!important; color:white!important; }
+        .stButton>button, .stDownloadButton>button { background:#ffcc00!important; color:black!important; }
+        .stDataFrame { filter: invert(1) hue-rotate(180deg); }
+        </style>""",
+    }
+    css = THEMES.get(theme_name, "")
+    if css:
+        st.markdown(css, unsafe_allow_html=True)
 
-def send_otp(phone:str, code:str):
-    body = f"Check-up doğrulama kodunuz: {code}"
-    # OTP için logda personel_id olmayabilir; 0 yazıyoruz
-    ok, info = send_whatsapp_message(phone, body)
-    try:
-        log_message(0, f"OTP:{body}", ok, info)
-    except Exception:
-        pass
-    return ok, info
+# küçük animasyon ve hover
+st.markdown("""
+<style>
+.main > div { animation: fadeIn .35s ease-in-out; }
+@keyframes fadeIn { from{opacity:0; transform: translateY(6px);} to{opacity:1; transform:none;} }
+button[kind="primary"]:hover { transform: scale(1.03); transition: .15s; }
+</style>
+""", unsafe_allow_html=True)
 
-def create_user(username:str, password:str, phone:str, want_msgs:bool):
-    username = username.strip().lower()
-    phone = normalize_phone(phone)
-    with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
-        # create / update personnel (aktiflik doğrulamadan sonra ayarlanacak)
-        pid = upsert_personnel(name=username, phone=phone, active=0)
-        # generate OTP
-        code = f"{random.randint(100000,999999)}"
-        expire = (datetime.now() + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
-        c.execute("""INSERT INTO users(username,password_hash,phone,is_admin,receive_msgs,verified,personnel_id,created_at,otp_code,otp_expires)
-                     VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                  (username, hash_pw(password), phone, 0, 1 if want_msgs else 0, 0, pid, now_str(), code, expire))
-        return pid, code
+# ================== AUTH (BUGÜN HERKES ADMIN) ==================
+if "auth" not in st.session_state:
+    st.session_state.auth = {"logged_in": True, "is_admin": True, "username": "admin"}
 
-def verify_user(username:str, code:str)->bool:
-    with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
-        c.execute("SELECT id,receive_msgs,personnel_id,otp_code,otp_expires FROM users WHERE username=?", (username,))
-        row = c.fetchone()
-    if not row: return False
-    uid, recv, pid, otp, expires = row
-    if otp != code: return False
-    if datetime.now() > datetime.strptime(expires, "%Y-%m-%d %H:%M:%S"):
-        return False
-    with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
-        c.execute("UPDATE users SET verified=1, otp_code=NULL, otp_expires=NULL WHERE id=?", (uid,))
-    set_personnel_active(pid, 1 if recv else 0)
-    return True
+# ================== APPLY THEME ==================
+apply_theme(get_setting("theme", "Sistem (varsayılan)"))
 
-def user_login(username:str, password:str):
-    with closing(get_conn()) as conn, closing(conn.cursor()) as c:
-        c.execute("""SELECT id,username,phone,is_admin,receive_msgs,verified,personnel_id,password_hash
-                     FROM users WHERE username=?""", (username.strip().lower(),))
-        row = c.fetchone()
-    if not row: return None
-    uid, uname, phone, is_admin, recv, verified, pid, pwh = row
-    if pwh != hash_pw(password): return None
-    return {"uid":uid, "username":uname, "phone":phone, "is_admin":bool(is_admin),
-            "receive_msgs":bool(recv), "verified":bool(verified), "personnel_id":pid}
-
-def require_login():
-    if "auth" not in st.session_state:
-        st.session_state.auth = {"logged_in": False, "is_admin": False}
-
-    if not st.session_state.auth["logged_in"]:
-        st.set_page_config(page_title="Check-up Takip", page_icon="✅", layout="wide")
-        st.title("✅ Check-up Takip Sistemi")
-
-        tab_giris, tab_kayit = st.tabs(["🔐 Giriş", "📝 Kayıt"])
-
-        # --- GİRİŞ ---
-        with tab_giris:
-            st.subheader("Sistem Girişi")
-            with st.form("frm_login"):
-                u = st.text_input("Kullanıcı Adı")
-                p = st.text_input("Parola", type="password")
-                submitted = st.form_submit_button("Giriş Yap")
-            if submitted:
-                # Admin kısa yol
-                if u == ADMIN_USERNAME and p == ADMIN_PASSWORD:
-                    st.session_state.auth = {"logged_in": True, "is_admin": True,
-                                             "username": "admin", "personnel_id": None,
-                                             "receive_msgs": True}
-                    st.success("Admin olarak giriş yapıldı.")
-                    st.rerun()
-                else:
-                    info = user_login(u, p)
-                    if info and info["verified"]:
-                        st.session_state.auth = {"logged_in": True,
-                                                 "is_admin": info["is_admin"],
-                                                 "username": info["username"],
-                                                 "personnel_id": info["personnel_id"],
-                                                 "receive_msgs": info["receive_msgs"]}
-                        st.success("Giriş başarılı.")
-                        st.rerun()
-                    else:
-                        st.error("Giriş başarısız veya telefon doğrulanmamış.")
-
-        # --- KAYIT ---
-        with tab_kayit:
-            st.subheader("Yeni Kayıt")
-            if "pending_user" not in st.session_state:
-                with st.form("frm_register"):
-                    uname = st.text_input("Kullanıcı Adı (sade harf/rakam)")
-                    pw = st.text_input("Parola", type="password")
-                    phone = st.text_input("Telefon (+90...)")
-                    want_msgs = st.checkbox("WhatsApp mesajları almak istiyorum", value=True)
-                    ok = st.form_submit_button("Kayıt Ol")
-                if ok:
-                    try:
-                        pid, code = create_user(uname, pw, phone, want_msgs)
-                        ok2, _info = send_otp(phone, code)
-                        st.session_state.pending_user = {"username": uname, "phone": phone}
-                        st.success("Kayıt alındı. Telefonunuza gelen doğrulama kodunu girin.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Hata: {e}")
-            else:
-                st.info(f"{st.session_state.pending_user['phone']} numarasına gönderilen kodu girin.")
-                with st.form("frm_otp"):
-                    code_in = st.text_input("Doğrulama Kodu (6 hane)")
-                    okv = st.form_submit_button("Doğrula")
-                if okv:
-                    if verify_user(st.session_state.pending_user["username"], code_in.strip()):
-                        st.success("Telefon doğrulandı. Artık giriş yapabilirsiniz.")
-                        del st.session_state["pending_user"]
-                    else:
-                        st.error("Kod hatalı veya süresi doldu.")
-        st.stop()
-
-# ================== UI (MAIN APP) ==================
-st.set_page_config(page_title="Check-up Takip", page_icon="✅", layout="wide")
-require_login()
-
-# hide chrome for non-admin
-hide_streamlit_chrome(hide=not st.session_state.auth.get("is_admin", False))
-
-st.title("✅ Check-up Takip Sistemi")
-
-# Tarih
+# ================== SIDEBAR ==================
 picked_date = st.sidebar.date_input("📅 Tarih seç", value=date.today(), key="dt_pick")
-sel_iso = to_iso(picked_date)
-sel_disp = to_display(picked_date)
+sel_iso = to_iso(picked_date); sel_disp = to_display(picked_date)
 
 with st.sidebar:
     st.divider()
     st.subheader("🔌 Sistem")
     st.write("• Twilio:", "✅" if (_twilio_ok and TWILIO_ACCOUNT_SID) else "⚠️ Ayarları kontrol edin")
     st.write("• Tarih:", sel_disp)
-    # Profil ayarları (mesaj alma tercihi) — kullanıcılar için
-    if not st.session_state.auth.get("is_admin", False):
-        st.markdown("### 👤 Profil")
-        recv = st.checkbox("WhatsApp mesajları almak istiyorum", value=st.session_state.auth.get("receive_msgs", True), key="profile_recv")
-        if st.button("Kaydet", key="btn_profile_save"):
-            with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
-                c.execute("UPDATE users SET receive_msgs=? WHERE username=?",
-                          (1 if recv else 0, st.session_state.auth["username"]))
-            st.session_state.auth["receive_msgs"] = recv
-            pid = st.session_state.auth.get("personnel_id")
-            if pid:
-                set_personnel_active(pid, 1 if recv else 0)
-            st.success("Tercih güncellendi.")
-    if st.button("🚪 Çıkış", key="btn_logout"):
-        st.session_state.auth = {"logged_in": False, "is_admin": False}
-        st.rerun()
 
-# Sekmeler: admin her şeyi görür; kullanıcı sade (Hastalar, Tetkik, Özeti)
-if st.session_state.auth.get("is_admin", False):
-    tabs = st.tabs(["🧑‍⚕️ Hastalar", "🧪 Tetkik", "📊 Gün Özeti", "📲 Mesaj (Personel)", "👥 Personel", "💾 Yedek"])
-else:
-    tabs = st.tabs(["🧑‍⚕️ Hastalar", "🧪 Tetkik", "📊 Gün Özeti"])
+    st.divider()
+    with st.expander("⚙️ Ayarlar", expanded=False):
+        # --- Tema ---
+        st.markdown("#### 🎨 Tema")
+        saved_theme = get_setting("theme", "Sistem (varsayılan)")
+        themes = ["Sistem (varsayılan)", "Açık", "Klinik (mint)", "Yüksek Kontrast"]
+        theme = st.selectbox("Tema seç", themes, index=themes.index(saved_theme), key="sel_theme")
+        if st.button("Temayı Uygula", key="btn_apply_theme"):
+            set_setting("theme", theme)
+            st.success("Tema güncellendi.")
+            st.rerun()
+
+        st.divider()
+        # --- Numara yönetimi (opt-in/opt-out) ---
+        st.markdown("#### 👥 Mesaj Alacak Numaralar")
+        people = list_personnel(active_only=False)  # [(id,name,phone,active)]
+        if people:
+            for pid, name, phone, active in people:
+                colA, colB, colC = st.columns([3,1,1])
+                colA.caption(f"**{name}** — {phone}")
+                toggled = colB.toggle("Aktif", value=bool(active), key=f"pact_{pid}")
+                if toggled != bool(active):
+                    set_personnel_active(pid, 1 if toggled else 0)
+                    st.toast(f"{name}: {'Aktif' if toggled else 'Pasif'}", icon="✅")
+                if colC.button("Sil", key=f"pdel_{pid}"):
+                    delete_personnel(pid)
+                    st.success("Silindi.")
+                    st.rerun()
+        else:
+            st.info("Kayıtlı numara yok.")
+
+        st.markdown("#### ➕ Numara Ekle")
+        with st.form("frm_add_staff_quick", clear_on_submit=True):
+            nm = st.text_input("Ad / not", key="nm_add_quick")
+            ph = st.text_input("Telefon (+90...)", key="ph_add_quick")
+            act = st.checkbox("Mesaj alsın (Aktif)", value=True, key="ph_add_active")
+            submit_add = st.form_submit_button("Ekle")
+        if submit_add:
+            try:
+                upsert_personnel(nm, ph, 1 if act else 0)
+                st.success("Eklendi.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Hata: {e}")
+
+        st.divider()
+        st.markdown("#### 🧪 WhatsApp Testi")
+        test_to = st.text_input("Test alıcı (+90...)", key="wa_test_to")
+        if st.button("Test mesajı gönder", key="wa_test_btn"):
+            ok, info = send_whatsapp_message(test_to, "Test: Check-up WhatsApp bağlantısı çalışıyor.")
+            st.success(f"OK: {info}") if ok else st.error(f"Hata: {info}")
+
+    if st.button("🚪 Çıkış", key="btn_logout"):
+        st.session_state.auth = {"logged_in": True, "is_admin": True, "username": "admin"}  # bugün admin kalalım
+        st.experimental_rerun()
+
+# ================== MAIN ==================
+st.title("✅ Check-up Takip Sistemi")
+
+tab_hasta, tab_tetkik, tab_ozet, tab_yedek = st.tabs(
+    ["🧑‍⚕️ Hastalar", "🧪 Tetkik Takibi", "📊 Gün Özeti", "💾 Yedek"]
+)
 
 # -------- 🧑‍⚕️ Hastalar --------
-with tabs[0]:
+with tab_hasta:
     st.subheader(f"{sel_disp} — Hasta Listesi")
     pts = list_patients(visit_date_iso=sel_iso)
     st.dataframe([{"ID":p[0], "Ad":p[1], "Soyad":p[2], "Alarm Saati":p[6] or "-"} for p in pts],
@@ -448,8 +421,8 @@ with tabs[0]:
             st.success("Hasta ve tetkikleri silindi.")
             st.rerun()
 
-# -------- 🧪 Tetkik --------
-with tabs[1]:
+# -------- 🧪 Tetkik Takibi --------
+with tab_tetkik:
     pts_today = list_patients(visit_date_iso=sel_iso)
     if not pts_today:
         st.info("Bu tarih için hasta yok.")
@@ -461,7 +434,7 @@ with tabs[1]:
         st.markdown("#### Tetkik Ekle")
         with st.form("frm_add_test", clear_on_submit=True):
             tname = st.text_input("Tetkik adı")
-            alarm_check = st.checkbox("🔔 Alarm kurmak istiyorum")
+            alarm_check = st.checkbox("🔔 Alarm kurmak istiyorum", key="chk_alarm")
             alarm_hhmm = None
             if alarm_check:
                 colh, colm = st.columns(2)
@@ -481,27 +454,30 @@ with tabs[1]:
 
         st.markdown("#### Tetkikler")
         trs = list_patient_tests(patient_id=pid)
-        for t in trs:
-            tid, _, fn, ln, tname, tstatus, updated = t
-            icon = "✅" if tstatus=="tamamlandi" else "⏳"
-            cols = st.columns([6,1,1,1])
-            cols[0].markdown(f"{icon} **{tname}** — {updated}")
-            if tstatus == "bekliyor":
-                if cols[1].button("Tamamla", key=f"done_{tid}"):
-                    update_patient_test_status(tid, "tamamlandi")
-                    auto_message_for_patient(pid)
+        if not trs:
+            st.info("Tetkik kaydı yok.")
+        else:
+            for t in trs:
+                tid, _, fn, ln, tname, tstatus, updated = t
+                icon = "✅" if tstatus=="tamamlandi" else "⏳"
+                cols = st.columns([6,1,1,1])
+                cols[0].markdown(f"{icon} **{tname}** — {updated}")
+                if tstatus == "bekliyor":
+                    if cols[1].button("Tamamla", key=f"done_{tid}"):
+                        update_patient_test_status(tid, "tamamlandi")
+                        auto_message_for_patient(pid)
+                        st.rerun()
+                else:
+                    if cols[2].button("Geri Al", key=f"undo_{tid}"):
+                        update_patient_test_status(tid, "bekliyor")
+                        auto_message_for_patient(pid)
+                        st.rerun()
+                if cols[3].button("Sil", key=f"del_{tid}"):
+                    delete_patient_test(tid)
                     st.rerun()
-            else:
-                if cols[2].button("Geri Al", key=f"undo_{tid}"):
-                    update_patient_test_status(tid, "bekliyor")
-                    auto_message_for_patient(pid)
-                    st.rerun()
-            if cols[3].button("Sil", key=f"del_{tid}"):
-                delete_patient_test(tid)
-                st.rerun()
 
 # -------- 📊 Gün Özeti --------
-with tabs[2]:
+with tab_ozet:
     st.subheader(f"{sel_disp} — Gün Özeti")
     pts = list_patients(visit_date_iso=sel_iso)
     if not pts:
@@ -520,62 +496,31 @@ with tabs[2]:
             })
         st.dataframe(rows, use_container_width=True)
 
-# -------- Admin’e özel ek sekmeler --------
-if st.session_state.auth.get("is_admin", False):
-    # 📲 Mesaj
-    with tabs[3]:
-        st.subheader("WhatsApp Mesaj (Personel)")
-        staff = list_personnel(active_only=True)
-        if not staff:
-            st.info("Aktif personel yok.")
-        else:
-            sel_staff = st.multiselect("Alıcılar", [(s[0], f"{s[1]} — {s[2]}") for s in staff],
-                                       format_func=lambda x: x[1], key="ms_sel_staff")
-            msg = st.text_area("Mesaj", height=120, key="ms_body")
-            if st.button("Gönder", key="ms_send"):
-                okc, errc = 0, 0
-                for sid, _ in sel_staff:
-                    phone = [x[2] for x in staff if x[0]==sid][0]
-                    ok, info = send_whatsapp_message(phone, msg)
-                    log_message(sid, msg, ok, info)
-                    okc += 1 if ok else 0
-                    errc += 0 if ok else 1
-                if okc and not errc: st.success(f"{okc} kişiye gönderildi.")
-                elif okc and errc:   st.warning(f"{okc} başarılı, {errc} hatalı.")
-                else:                st.error("Gönderim başarısız.")
+# -------- 💾 Yedek --------
+with tab_yedek:
+    st.subheader("Yedek / Dışa Aktar (CSV)")
+    col1, col2 = st.columns(2)
 
-    # 👥 Personel
-    with tabs[4]:
-        st.subheader("Personel")
-        people = list_personnel(active_only=False)
-        st.dataframe(
-            [{"ID":p[0], "Ad/Username":p[1], "Telefon":p[2], "Aktif":"Evet" if p[3] else "Hayır"} for p in people],
-            use_container_width=True
-        )
+    def _csv(query:str):
+        with closing(get_conn()) as conn, closing(conn.cursor()) as c:
+            c.execute(query)
+            rows = c.fetchall()
+            headers = [d[0] for d in c.description]
+        buf = io.StringIO()
+        w = csv.writer(buf); w.writerow(headers); w.writerows(rows)
+        return buf.getvalue().encode("utf-8")
 
-    # 💾 Yedek
-    with tabs[5]:
-        st.subheader("Yedek / Dışa Aktar (CSV)")
-        col1, col2 = st.columns(2)
-        def _csv(query:str):
-            with closing(get_conn()) as conn, closing(conn.cursor()) as c:
-                c.execute(query)
-                rows = c.fetchall()
-                headers = [d[0] for d in c.description]
-            buf = io.StringIO()
-            w = csv.writer(buf); w.writerow(headers); w.writerows(rows)
-            return buf.getvalue().encode("utf-8")
-        with col1:
-            if st.button("Hastalar CSV", key="dl_pat"):
-                st.download_button("İndir – patients.csv", _csv("SELECT * FROM patients"),
-                                   "patients.csv", "text/csv", key="dl_pat_btn")
-            if st.button("Tetkikler CSV", key="dl_tests"):
-                st.download_button("İndir – patient_tests.csv", _csv("SELECT * FROM patient_tests"),
-                                   "patient_tests.csv", "text/csv", key="dl_tests_btn")
-        with col2:
-            if st.button("Personel CSV", key="dl_staff"):
-                st.download_button("İndir – personnel.csv", _csv("SELECT * FROM personnel"),
-                                   "personnel.csv", "text/csv", key="dl_staff_btn")
-            if st.button("Mesaj Logları CSV", key="dl_logs"):
-                st.download_button("İndir – msg_logs.csv", _csv("SELECT * FROM msg_logs"),
-                                   "msg_logs.csv", "text/csv", key="dl_logs_btn")
+    with col1:
+        if st.button("Hastalar CSV", key="dl_pat"):
+            st.download_button("İndir – patients.csv", _csv("SELECT * FROM patients"),
+                               "patients.csv", "text/csv", key="dl_pat_btn")
+        if st.button("Tetkikler CSV", key="dl_tests"):
+            st.download_button("İndir – patient_tests.csv", _csv("SELECT * FROM patient_tests"),
+                               "patient_tests.csv", "text/csv", key="dl_tests_btn")
+    with col2:
+        if st.button("Personel CSV", key="dl_staff"):
+            st.download_button("İndir – personnel.csv", _csv("SELECT * FROM personnel"),
+                               "personnel.csv", "text/csv", key="dl_staff_btn")
+        if st.button("Mesaj Logları CSV", key="dl_logs"):
+            st.download_button("İndir – msg_logs.csv", _csv("SELECT * FROM msg_logs"),
+                               "msg_logs.csv", "text/csv", key="dl_logs_btn")
