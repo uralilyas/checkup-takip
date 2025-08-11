@@ -12,9 +12,6 @@ TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
 TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM", "")  # +14155238886 veya whatsapp:+14155238886 (sandbox)
 
-ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "changeme")
-
 try:
     from twilio.rest import Client
     _twilio_ok = True
@@ -32,6 +29,7 @@ def column_exists(conn, table, column) -> bool:
 
 def init_db():
     with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
+        # Personel (mesaj alıcıları)
         c.execute("""CREATE TABLE IF NOT EXISTS personnel(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
@@ -39,6 +37,8 @@ def init_db():
             active INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL
         )""")
+
+        # Hastalar
         c.execute("""CREATE TABLE IF NOT EXISTS patients(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             first_name TEXT NOT NULL,
@@ -53,6 +53,8 @@ def init_db():
             c.execute("UPDATE patients SET department='Genel' WHERE department IS NULL")
         if not column_exists(conn, "patients", "visit_time"):
             c.execute("ALTER TABLE patients ADD COLUMN visit_time TEXT")  # HH:MM
+
+        # Tetkikler
         c.execute("""CREATE TABLE IF NOT EXISTS patient_tests(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             patient_id INTEGER NOT NULL,
@@ -61,6 +63,8 @@ def init_db():
             updated_at TEXT NOT NULL,
             FOREIGN KEY (patient_id) REFERENCES patients(id)
         )""")
+
+        # Mesaj logları
         c.execute("""CREATE TABLE IF NOT EXISTS msg_logs(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             personnel_id INTEGER NOT NULL,
@@ -70,21 +74,8 @@ def init_db():
             created_at TEXT NOT NULL,
             FOREIGN KEY (personnel_id) REFERENCES personnel(id)
         )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS users(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL UNIQUE,
-            password_hash TEXT NOT NULL,
-            phone TEXT NOT NULL,
-            is_admin INTEGER NOT NULL DEFAULT 0,
-            receive_msgs INTEGER NOT NULL DEFAULT 1,
-            verified INTEGER NOT NULL DEFAULT 0,
-            personnel_id INTEGER,
-            created_at TEXT NOT NULL,
-            otp_code TEXT,
-            otp_expires TEXT,
-            FOREIGN KEY (personnel_id) REFERENCES personnel(id)
-        )""")
-        # basit ayarlar
+
+        # Basit ayarlar (tema vb.)
         c.execute("""CREATE TABLE IF NOT EXISTS app_settings(
             key TEXT PRIMARY KEY,
             val TEXT
@@ -108,8 +99,6 @@ def _wa_from() -> str:
         return f
     f = normalize_phone(f) if f else ""
     return f"whatsapp:{f}" if f else ""
-
-def hash_pw(pw:str)->str: return hashlib.sha256((pw or "").encode("utf-8")).hexdigest()
 
 # ---- Settings helpers ----
 def get_setting(key:str, default:str=""):
@@ -300,7 +289,7 @@ def apply_theme(theme_name: str):
     if css:
         st.markdown(css, unsafe_allow_html=True)
 
-# küçük animasyon ve hover
+# mini animasyon/hover
 st.markdown("""
 <style>
 .main > div { animation: fadeIn .35s ease-in-out; }
@@ -376,11 +365,10 @@ with st.sidebar:
         test_to = st.text_input("Test alıcı (+90...)", key="wa_test_to")
         if st.button("Test mesajı gönder", key="wa_test_btn"):
             ok, info = send_whatsapp_message(test_to, "Test: Check-up WhatsApp bağlantısı çalışıyor.")
-            st.success(f"OK: {info}") if ok else st.error(f"Hata: {info}")
-
-    if st.button("🚪 Çıkış", key="btn_logout"):
-        st.session_state.auth = {"logged_in": True, "is_admin": True, "username": "admin"}  # bugün admin kalalım
-        st.experimental_rerun()
+            if ok:
+                st.success(f"OK: {info}")
+            else:
+                st.error(f"Hata: {info}")
 
 # ================== MAIN ==================
 st.title("✅ Check-up Takip Sistemi")
