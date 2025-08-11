@@ -1,9 +1,8 @@
 # app.py
 import os, sqlite3, csv, io, zipfile
-from datetime import datetime, date, time as dtime, timedelta
+from datetime import datetime, date, timedelta
 from contextlib import closing
 from urllib.parse import quote_plus
-
 import streamlit as st
 
 # ================== CONFIG ==================
@@ -158,7 +157,6 @@ def build_ics(patient_name:str, visit_date_iso:str, hhmm:str,
     dtstamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     dtstart = dt.strftime("%Y%m%dT%H%M%S")
     dtend   = dt_end.strftime("%Y%m%dT%H%M%S")
-
     uid = f"{abs(hash((patient_name, visit_date_iso, hhmm, dtstamp)))}@checkup"
     summary = f"{title_prefix} – {patient_name}"
     desc = f"{patient_name} randevusu. Hatırlatıcı: {remind_min} dk önce."
@@ -237,8 +235,8 @@ with st.sidebar:
         st.markdown("#### 🎨 Tema")
         themes = ["Sistem (varsayılan)", "Açık", "Klinik (mint)", "Yüksek Kontrast"]
         cur = get_setting("theme", "Sistem (varsayılan)")
-        new_t = st.selectbox("Tema seç", themes, index=themes.index(cur))
-        if st.button("Temayı Uygula"):
+        new_t = st.selectbox("Tema seç", themes, index=themes.index(cur), key="sel_theme")
+        if st.button("Temayı Uygula", key="btn_apply_theme"):
             set_setting("theme", new_t); st.rerun()
 
         st.divider()
@@ -268,6 +266,20 @@ with st.sidebar:
                 except Exception as e:
                     st.error(f"Hata: {e}")
 
+        st.divider()
+        st.markdown("#### ✅ Varsayılan WhatsApp alıcı")
+        ppl_active = list_personnel(active_only=True)
+        options = [(p[2], f"{p[1]} — {p[2]}") for p in ppl_active] or [("", "Aktif kişi yok")]
+        default_phone = get_setting("default_recipient", options[0][0] if options and options[0][0] else "")
+        sel_def_idx = 0
+        for i, o in enumerate(options):
+            if o[0] == default_phone:
+                sel_def_idx = i; break
+        sel_def = st.selectbox("Kişi seç", options, index=sel_def_idx, key="sel_default_recipient")
+        if st.button("Varsayılanı Kaydet", key="btn_save_default_recipient"):
+            set_setting("default_recipient", sel_def[0] if sel_def[0] else "")
+            st.success("Varsayılan alıcı kaydedildi.")
+
 # ================== MAIN ==================
 st.title("✅ Check-up Takip Sistemi")
 tab_hasta, tab_tetkik, tab_ozet, tab_yedek = st.tabs(
@@ -288,7 +300,7 @@ with tab_hasta:
         ln = c2.text_input("Soyad")
         age = c3.number_input("Yaş", 0, 120, 0, 1)
         gender = st.selectbox("Cinsiyet", ["Kadın","Erkek","Diğer"])
-        if st.form_submit_button("Ekle"):
+        if st.form_submit_button("Ekle", key="btn_add_patient"):
             if not fn.strip() or not ln.strip():
                 st.warning("Ad ve Soyad zorunludur.")
             else:
@@ -311,7 +323,7 @@ with tab_tetkik:
         sel = st.selectbox("Hasta", [(p[0], f"{p[1]} {p[2]}") for p in pts_today],
                            format_func=lambda x:x[1], key="sel_pt_for_tests")
         pid = sel[0]
-        # Tetkik ekle + isteğe bağlı alarm
+
         st.markdown("#### Tetkik Ekle")
         with st.form("frm_add_test", clear_on_submit=True):
             tname = st.text_input("Tetkik adı")
@@ -322,7 +334,7 @@ with tab_tetkik:
                 hour = colh.selectbox("Saat", [f"{h:02d}" for h in range(24)], key="alarm_hour")
                 minute = colm.selectbox("Dakika", [f"{m:02d}" for m in range(0,60,5)], key="alarm_min")
                 hhmm = f"{hour}:{minute}"
-            addt = st.form_submit_button("Ekle")
+            addt = st.form_submit_button("Ekle", key="btn_add_test")
         if addt:
             if not tname.strip():
                 st.warning("Tetkik adı zorunlu.")
@@ -346,28 +358,54 @@ with tab_tetkik:
             patient_name = f"{p_row[1]} {p_row[2]}"
             visit_hhmm = p_row[6]
 
-            # WhatsApp metni
+            # -- WhatsApp metni --
             done = [t[2] for t in trs if t[3]=="tamamlandi"]
             rem  = [t[2] for t in trs if t[3]=="bekliyor"]
             wa_text = (f"📌 Tetkik Güncellemesi\n"
                        f"Hasta: {patient_name} ({sel_disp})\n"
                        f"Tamamlanan: {', '.join(done) if done else '-'}\n"
                        f"Kalan: {', '.join(rem) if rem else '-'}")
-            # Hedef kişi seçimi (ayarlar kişilerinden)
+
             active_people = list_personnel(active_only=True)
-            receivers = [(p[2], f"{p[1]} — {p[2]}") for p in active_people] or [("+900000000000","Numara ekleyin (Ayarlar)")]
+            receivers = [(p[2], f"{p[1]} — {p[2]}") for p in active_people]
+            default_phone = get_setting("default_recipient", receivers[0][0] if receivers else "")
 
             cwa, cics = st.columns([2,2])
             with cwa:
-                recv = st.selectbox("WhatsApp alıcı", receivers, format_func=lambda x:x[1], key="wa_recv")
-                st.link_button("💬 WhatsApp’tan gönder", make_whatsapp_link(recv[0], wa_text))
-                st.caption("Mesaj hazır açılır; gönderme kararı sizde.")
+                st.markdown("**💬 WhatsApp**")
+                # 2a) Tek tık: varsayılan alıcıya gönder
+                if default_phone:
+                    st.link_button("Gönder (varsayılan)", make_whatsapp_link(default_phone, wa_text),
+                                   use_container_width=True)
+                    st.caption(f"Varsayılan: {default_phone}")
+                else:
+                    st.info("Ayarlar > 'Varsayılan alıcı'yı belirleyin.")
+
+                # 2b) İstersen farklı alıcı
+                if receivers:
+                    recv = st.selectbox("Başka alıcı", receivers, format_func=lambda x:x[1], key="wa_recv_alt")
+                    st.link_button("Bu kişiye gönder", make_whatsapp_link(recv[0], wa_text),
+                                   use_container_width=True)
+                else:
+                    st.info("Ayarlar > Kişiler bölümüne en az bir aktif kişi ekleyin.")
+
+                # 2c) Mesajı kopyala (Safari uyumlu)
+                with st.popover("Mesajı kopyala"):
+                    st.code(wa_text, language=None)
+
+                # 2d) Aktif herkese bağlantılar
+                if receivers:
+                    with st.expander("Aktif herkese bağlantıları göster"):
+                        for ph, label in receivers:
+                            st.markdown(f"- [{label}]({make_whatsapp_link(ph, wa_text)})")
+
             with cics:
+                # .ics butonu (10 dk önce uyarı)
                 if visit_hhmm:
                     ics_bytes = build_ics(patient_name, sel_iso, visit_hhmm)
                     st.download_button("🔔 Takvime ekle (.ics, 10 dk önce uyar)", data=ics_bytes,
                                        file_name=f"checkup_{patient_name.replace(' ','_')}_{sel_iso}_{visit_hhmm}.ics",
-                                       mime="text/calendar")
+                                       mime="text/calendar", key="dl_ics_single")
                 else:
                     st.info("Alarm için saat kaydı yok. Tetkik eklerken 'Alarm kur' ile saat seçebilirsin.")
 
@@ -413,7 +451,7 @@ with tab_ozet:
                     z.writestr(f"{pname.replace(' ','_')}_{sel_iso}_{p[6]}.ics", ics)
             mem.seek(0)
             st.download_button("📦 Tüm randevuları .zip (10 dk önce uyarı)", mem,
-                               file_name=f"{sel_iso}_randevular.zip", mime="application/zip")
+                               file_name=f"{sel_iso}_randevular.zip", mime="application/zip", key="dl_zip_all")
 
 # ---- Yedek
 with tab_yedek:
@@ -425,7 +463,7 @@ with tab_yedek:
         return buf.getvalue().encode("utf-8")
     c1,c2 = st.columns(2)
     with c1:
-        st.download_button("Hastalar CSV", _csv("SELECT * FROM patients"), "patients.csv", "text/csv")
-        st.download_button("Tetkikler CSV", _csv("SELECT * FROM patient_tests"), "patient_tests.csv", "text/csv")
+        st.download_button("Hastalar CSV", _csv("SELECT * FROM patients"), "patients.csv", "text/csv", key="dl_pat_csv")
+        st.download_button("Tetkikler CSV", _csv("SELECT * FROM patient_tests"), "patient_tests.csv", "text/csv", key="dl_tests_csv")
     with c2:
-        st.download_button("Kişiler CSV", _csv("SELECT * FROM personnel"), "personnel.csv", "text/csv")
+        st.download_button("Kişiler CSV", _csv("SELECT * FROM personnel"), "personnel.csv", "text/csv", key="dl_staff_csv")
