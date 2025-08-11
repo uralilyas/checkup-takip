@@ -80,8 +80,8 @@ def set_setting(key,val):
 # =================== PERSONNEL ===================
 def list_personnel(active_only=True):
     with closing(get_conn()) as conn, closing(conn.cursor()) as c:
-        q="SELECT id,name,phone,active FROM personnel"; 
-        if active_only: q+=" WHERE active=1"; 
+        q="SELECT id,name,phone,active FROM personnel"
+        if active_only: q+=" WHERE active=1"
         q+=" ORDER BY name"; c.execute(q); return c.fetchall()
 def upsert_personnel(name,phone,active:int):
     phone=normalize_phone(phone)
@@ -158,11 +158,12 @@ def create_package(name:str, tests:list[str]):
 def rename_package(pkg_id:int, new_name:str):
     with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
         c.execute("UPDATE packages SET name=? WHERE id=?", (new_name.strip(), pkg_id))
-def add_test_to_package(pkg_id:int, test_name:str):
+def add_test_to_package(pkg_id:int, test_name:str, ord_hint:int|None=None):
     with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
-        c.execute("SELECT COALESCE(MAX(ord),-1)+1 FROM package_tests WHERE package_id=?", (pkg_id,))
-        nxt=c.fetchone()[0]
-        c.execute("INSERT INTO package_tests(package_id,test_name,ord) VALUES(?,?,?)",(pkg_id,test_name.strip(),nxt))
+        if ord_hint is None:
+            c.execute("SELECT COALESCE(MAX(ord),-1)+1 FROM package_tests WHERE package_id=?", (pkg_id,))
+            ord_hint=c.fetchone()[0]
+        c.execute("INSERT INTO package_tests(package_id,test_name,ord) VALUES(?,?,?)",(pkg_id,test_name.strip(),ord_hint))
 def delete_test_from_package(pt_id:int):
     with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
         c.execute("DELETE FROM package_tests WHERE id=?", (pt_id,))
@@ -221,35 +222,30 @@ def apply_theme(theme_name:str):
     THEMES={
         "Sistemle Uyumlu": """
         <style>
-        :root{ --pad:.72rem; }
+        :root{ --chip-bg: #e2f6ff; --chip-tx: #0b4a6f; --card:#ffffff; --border:#e5e7eb; }
         @media (prefers-color-scheme: light){
           body,.stApp{ background:#f8fafc!important; color:#0f172a!important;}
-          .btn{ background:linear-gradient(135deg,#0ea5e9,#22c55e)!important; color:#fff!important; border:none!important; border-radius:12px!important; }
         }
         @media (prefers-color-scheme: dark){
           body,.stApp{ background:#0b1220!important; color:#e5e7eb!important;}
-          .btn{ background:#1f2937!important; color:#e5e7eb!important; border:1px solid #334155!important; border-radius:12px!important; }
+          :root{ --chip-bg:#143041; --chip-tx:#d3efff; --card:#0f172a; --border:#233042; }
         }
-        </style>
-        """,
+        </style>""",
         "Klinik Açık": """
         <style>
+        :root{ --chip-bg:#e6fff3; --chip-tx:#064e3b; --card:#ffffff; --border:#e5e7eb; }
         body,.stApp{ background:#f7fbff!important; color:#0f172a!important;}
-        .btn{ background:linear-gradient(135deg,#0ea5e9,#22c55e)!important; color:#fff!important; border:none!important; border-radius:12px!important;}
-        </style>
-        """,
+        </style>""",
         "Gece Koyu": """
         <style>
+        :root{ --chip-bg:#1f2937; --chip-tx:#d1d5db; --card:#0f172a; --border:#233042; }
         body,.stApp{ background:#0b1220!important; color:#e5e7eb!important;}
-        .btn{ background:#1f2937!important; color:#e5e7eb!important; border:1px solid #334155!important; border-radius:12px!important;}
-        </style>
-        """,
+        </style>""",
         "Pastel Mint": """
         <style>
+        :root{ --chip-bg:#eafff7; --chip-tx:#065f46; --card:#ffffff; --border:#e5e7eb; }
         body,.stApp{ background:#f5fffb!important; color:#0f172a!important;}
-        .btn{ background:#10b981!important; color:#fff!important; border:none!important; border-radius:14px!important;}
-        </style>
-        """
+        </style>"""
     }
     css=THEMES.get(theme_name,""); 
     if css: st.markdown(css, unsafe_allow_html=True)
@@ -260,6 +256,12 @@ section.main > div { animation: fadeIn .35s ease-in-out; }
 @keyframes fadeIn { from{opacity:0; transform:translateY(6px);} to{opacity:1; transform:none;} }
 .stButton>button,.stDownloadButton>button,.stLinkButton>button{ padding:.72rem 1rem!important; font-weight:600!important; border-radius:12px!important; transition:transform .15s ease, filter .15s ease;}
 .stButton>button:hover,.stDownloadButton>button:hover,.stLinkButton>button:hover{ transform:translateY(-1px); filter:saturate(1.05);}
+
+/* Estetik Paket Kartları & Chip görünümü */
+.pkg-card{ border:1px solid var(--border); background:var(--card); border-radius:14px; padding:12px 14px; margin:8px 0; }
+.pkg-chip{ display:inline-block; padding:.35rem .6rem; border-radius:999px; background:var(--chip-bg); color:var(--chip-tx); margin:.22rem .28rem .22rem 0; font-size:.92rem; }
+.pkg-chip .rm{ margin-left:.45rem; opacity:.7; cursor:pointer; }
+.pkg-chip .rm:hover{ opacity:1; text-decoration:underline; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -384,7 +386,7 @@ with tab_tetkik:
                 else: st.success("Tetkik eklendi.")
                 st.rerun()
 
-        # Paket Ata
+        # Paket Ata (paket içeriği güzel görünüm)
         st.markdown("#### Paket Ata")
         pkgs=list_packages()
         if pkgs:
@@ -393,9 +395,23 @@ with tab_tetkik:
             if cbtn.button("Paketi uygula"):
                 apply_package_to_patient(pkg_sel[0], pid)
                 st.success(f"'{pkg_sel[1]}' paketi eklendi."); st.rerun()
+
             with st.expander("Paket içeriği"):
                 items=get_package_tests(pkg_sel[0])
-                st.write([f"{i+1}. {t[1]}" for i,t in enumerate(items)])
+                if not items:
+                    st.info("Paket boş.")
+                else:
+                    # Şık chip'lerle göster
+                    st.markdown('<div class="pkg-card">', unsafe_allow_html=True)
+                    cols = st.columns(2)
+                    half = (len(items)+1)//2
+                    left = items[:half]; right = items[half:]
+                    def _render(col, arr):
+                        with col:
+                            for idx,(pt_id, test_name, ord_) in enumerate(arr, start=1):
+                                st.markdown(f'<span class="pkg-chip">{idx}. {test_name}</span>', unsafe_allow_html=True)
+                    _render(cols[0], left); _render(cols[1], right)
+                    st.markdown('</div>', unsafe_allow_html=True)
         else:
             st.info("Önce Paketler sekmesinden paket oluşturun.")
 
@@ -403,16 +419,16 @@ with tab_tetkik:
         trs=list_patient_tests(pid)
         if not trs: st.info("Tetkik yok.")
         else:
-            # Mesaj metni
             done=[t[2] for t in trs if t[3]=="tamamlandi"]
             rem=[t[2] for t in trs if t[3]=="bekliyor"]
             tpl=get_setting("wa_template","Hasta: {patient} ({date})\nTamamlanan: {done}\nKalan: {remaining}")
-            msg=tpl.format(patient=patient_name, date=to_display(today_tr_date()) if sel_iso==to_iso(today_tr_date()) else to_display(picked_date),
+            msg=tpl.format(patient=patient_name, date=sel_disp,
                            done=", ".join(done) if done else "-", remaining=", ".join(rem) if rem else "-")
-            # WhatsApp alanı
+
             active_people=list_personnel(active_only=True)
             receivers=[(p[2], f"{p[1]} — {p[2]}") for p in active_people]
             default_phone=get_setting("default_recipient", receivers[0][0] if receivers else "")
+
             cwa,cics=st.columns([2,2])
             with cwa:
                 st.markdown("**💬 WhatsApp**")
@@ -422,9 +438,9 @@ with tab_tetkik:
                     recv=st.selectbox("Başka alıcı", receivers, format_func=lambda x:x[1], key="wa_alt")
                     st.link_button("Bu kişiye gönder", make_whatsapp_link(recv[0], msg), use_container_width=True)
                     multi=st.multiselect("Çoklu alıcı", receivers, format_func=lambda x:x[1], key="wa_multi")
-                    for ph,label in multi:
-                        st.link_button(f"{label}’a gönder", make_whatsapp_link(ph, msg))
+                    for ph,label in multi: st.link_button(f"{label}’a gönder", make_whatsapp_link(ph, msg))
                 with st.popover("Mesajı kopyala"): st.code(msg, language=None)
+
             with cics:
                 if visit_hhmm:
                     rem_min=st.selectbox("Alarm süresi", [5,10,15,30], index=1)
@@ -447,17 +463,20 @@ with tab_tetkik:
                     if c3.button("Geri Al", key=f"undo_{tid}"): update_patient_test_status(tid,"bekliyor"); st.rerun()
                 if c4.button("Sil", key=f"del_{tid}"): delete_patient_test(tid); st.rerun()
 
-# -------- Paketler (CRUD + test listesi + içe/dışa aktar) --------
+# -------- Paketler (CRUD + estetik içerik + çok satırlı ekleme) --------
 with tab_paket:
     st.subheader("📦 Check‑up Paketleri")
-    pkgs=list_packages()
 
+    pkgs=list_packages()
     col_a, col_b = st.columns([2,2])
+
+    # Yeni paket oluşturma (çok satırlı girdi)
     with col_a:
         st.markdown("### ➕ Yeni Paket")
         with st.form("pkg_new", clear_on_submit=True):
             name=st.text_input("Paket adı")
-            tests_area=st.text_area("Tetkikler (her satıra bir tetkik)", height=140)
+            tests_area=st.text_area("Tetkikler (her satır bir tetkik)", height=140,
+                                    placeholder="Kan Tahlili\nGörüntüleme\nEKG")
             ok=st.form_submit_button("Oluştur")
         if ok:
             tests=[t.strip() for t in tests_area.splitlines() if t.strip()]
@@ -472,17 +491,38 @@ with tab_paket:
             new_name=st.text_input("Yeni ad", value=sel_pkg[1], key="pkg_new_name")
             if st.button("Adı Güncelle"):
                 rename_package(sel_pkg[0], new_name); st.success("Güncellendi"); st.rerun()
-            st.markdown("**Tetkikler**")
+
+            st.markdown("**Paket İçeriği**")
             items=get_package_tests(sel_pkg[0])
-            for pt_id,test_name,_ord in items:
-                c1,c2 = st.columns([6,1])
-                c1.write(test_name)
-                if c2.button("Sil", key=f"pt_del_{pt_id}"):
-                    delete_test_from_package(pt_id); st.rerun()
-            with st.form("pkg_add_test", clear_on_submit=True):
-                t=st.text_input("Yeni tetkik")
-                if st.form_submit_button("Ekle"):
-                    if t.strip(): add_test_to_package(sel_pkg[0], t); st.rerun()
+            # Estetik chip görünümü + sil
+            if items:
+                st.markdown('<div class="pkg-card">', unsafe_allow_html=True)
+                for idx,(pt_id,test_name,_ord) in enumerate(items, start=1):
+                    # her chip yanında sil butonu için küçük form
+                    cols=st.columns([6,1])
+                    with cols[0]:
+                        st.markdown(f'<span class="pkg-chip">{idx}. {test_name}</span>', unsafe_allow_html=True)
+                    with cols[1]:
+                        if st.button("Sil", key=f"pt_del_{pt_id}"): delete_test_from_package(pt_id); st.rerun()
+                st.markdown('</div>', unsafe_allow_html=True)
+            else:
+                st.info("Bu paket henüz boş.")
+
+            # Çok satırlı toplu ekleme
+            st.markdown("**Tetkik Ekle (çok satırlı)**")
+            with st.form("pkg_add_tests_multi", clear_on_submit=True):
+                bulk=st.text_area("Her satır bir tetkik olacak şekilde giriniz", height=120,
+                                  placeholder="Hemogram\nEkokardiyografi\nEfor")
+                addm=st.form_submit_button("Ekle")
+            if addm:
+                lines=[l.strip() for l in bulk.splitlines() if l.strip()]
+                if not lines: st.warning("En az bir satır girin.")
+                else:
+                    # sıra numarasını doğru artır
+                    base_ord=len(items)
+                    for i,name in enumerate(lines):
+                        add_test_to_package(sel_pkg[0], name, ord_hint=base_ord+i)
+                    st.success(f"{len(lines)} tetkik eklendi."); st.rerun()
         else:
             st.info("Henüz paket yok.")
 
@@ -512,7 +552,6 @@ with tab_paket:
                 if r["type"]=="package":
                     created[r["name_or_test"]]=create_package(r["name_or_test"], [])
                 elif r["type"]=="item":
-                    # package_id integer geliyorsa kullan; yoksa ada göre yaratılmış olanı kullan
                     try: pid=int(r["id_or_package_id"])
                     except: pid=created.get(r["id_or_package_id"])
                     if pid: add_test_to_package(pid, r["name_or_test"])
@@ -560,4 +599,4 @@ with tab_yedek:
         st.download_button("Tetkikler CSV", _csv("SELECT * FROM patient_tests"), "patient_tests.csv","text/csv")
     with c2:
         st.download_button("Kişiler CSV", _csv("SELECT * FROM personnel"), "personnel.csv","text/csv")
-        st.download_button("Paketler CSV", _csv("SELECT * FROM packages"), "packages_only.csv","text/csv")
+        st.download_button("Paketler CSV (yalnızca başlıklar)", _csv("SELECT * FROM packages"), "packages_only.csv","text/csv")
