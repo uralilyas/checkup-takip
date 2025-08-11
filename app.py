@@ -1,5 +1,4 @@
-# app.py
-import os, sqlite3, csv, io, threading, time, random, hashlib
+import os, sqlite3, csv, io, threading, time, zipfile
 from datetime import datetime, date, timedelta
 from contextlib import closing
 import streamlit as st
@@ -8,9 +7,15 @@ import streamlit as st
 st.set_page_config(page_title="Check-up Takip", page_icon="✅", layout="wide")
 
 DB_PATH = "checkup.db"
+TZ = "Europe/Istanbul"  # bilgilendirme amaçlı; sistem saatini kullanıyoruz
+
+# ---- Ortam değişkenleri ----
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
-TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM", "")  # +14155238886 veya whatsapp:+14155238886 (sandbox)
+TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM", "")  # +14155238886 veya whatsapp:+14155238886 (sandbox/prod)
+
+ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
+ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin123")
 
 try:
     from twilio.rest import Client
@@ -75,7 +80,7 @@ def init_db():
             FOREIGN KEY (personnel_id) REFERENCES personnel(id)
         )""")
 
-        # Basit ayarlar (tema vb.)
+        # Basit ayarlar (tema, özet saati, şablonlar...)
         c.execute("""CREATE TABLE IF NOT EXISTS app_settings(
             key TEXT PRIMARY KEY,
             val TEXT
@@ -92,6 +97,8 @@ def normalize_phone(p: str) -> str:
     if p and not p.startswith("+"):
         p = "+" + p
     return p
+
+# Twilio from
 
 def _wa_from() -> str:
     f = (os.environ.get("TWILIO_WHATSAPP_FROM", TWILIO_WHATSAPP_FROM) or "").strip()
@@ -223,46 +230,130 @@ def log_message(personnel_id:int, body:str, ok:bool, info:str):
                      VALUES(?,?,?,?,?)""",
                   (personnel_id, body, "ok" if ok else "hata", info[:500], now_str()))
 
+# ---- Şablonlar ----
+DEFAULT_TEMPLATES = {
+    "tmpl_auto_update": (
+        "📌 Tetkik Güncellemesi\n"
+        "Hasta: {hasta_ad} {hasta_soyad}\n"
+        "Tamamlananlar: {tamamlanan}\n"
+        "Kalanlar: {kalan}"
+    ),
+    "tmpl_alarm_reminder": (
+        "📅 Hatırlatma:\n"
+        "{hasta_ad} {hasta_soyad}'ın 10 dakika sonra {bolum} randevusu var.\n"
+        "Lütfen bölüm ile teyit sağlayın ve hastaya eşlik edin."
+    ),
+    "tmpl_daily_summary": (
+        "📝 Günlük Özet – {tarih}\n"
+        "Toplam Hasta: {toplam_hasta}\n"
+        "Tamamlanan Tetkik: {toplam_tamam}\n"
+        "Bekleyen Tetkik: {toplam_bekleyen}"
+    )
+}
+
+for k, v in DEFAULT_TEMPLATES.items():
+    if get_setting(k, "") == "":
+        set_setting(k, v)
+
+# ---- Yardımcı: toplu alıcıya gönder ----
+def broadcast(body:str):
+    for staff in list_personnel(active_only=True):
+        ok, info = send_whatsapp_message(staff[2], body)
+        log_message(staff[0], body, ok, info)
+        time.sleep(0.2)  # hız limiti
+
+# ---- Otomatik tetkik güncellemesi ----
 def auto_message_for_patient(pid:int):
     trs = list_patient_tests(pid)
     done = [t[4] for t in trs if t[5] == "tamamlandi"]
     remain = [t[4] for t in trs if t[5] == "bekliyor"]
     with closing(get_conn()) as conn, closing(conn.cursor()) as c:
-        c.execute("SELECT first_name,last_name FROM patients WHERE id=?", (pid,))
+        c.execute("SELECT first_name,last_name,department FROM patients WHERE id=?", (pid,))
         row = c.fetchone()
     if not row: return
-    fn, ln = row
-    body = (f"📌 Tetkik Güncellemesi\n"
-            f"Hasta: {fn} {ln}\n"
-            f"Tamamlananlar: {', '.join(done) if done else '-'}\n"
-            f"Kalanlar: {', '.join(remain) if remain else '-'}")
-    for staff in list_personnel(active_only=True):
-        ok, info = send_whatsapp_message(staff[2], body)
-        log_message(staff[0], body, ok, info)
+    fn, ln, dept = row
+    tpl = get_setting("tmpl_auto_update", DEFAULT_TEMPLATES["tmpl_auto_update"])
+    body = tpl.format(
+        hasta_ad=fn,
+        hasta_soyad=ln,
+        tamamlanan=", ".join(done) if done else "-",
+        kalan=", ".join(remain) if remain else "-",
+        bolum=dept or "İlgili bölüm"
+    )
+    broadcast(body)
 
-# ================== ALARM (10 dk önce) ==================
-def check_alarms_loop():
+# ================== ALARM / GÜNLÜK ÖZET ZAMANLAYICILAR ==================
+
+def _hhmm_now():
+    return datetime.now().strftime("%H:%M")
+
+# 10 dk önce alarm (1 dakikalık pencere)
+def check_alarms_once():
+    today_iso = datetime.now().strftime("%Y-%m-%d")
+    target = (datetime.now() + timedelta(minutes=10)).strftime("%H:%M")
+    with closing(get_conn()) as conn, closing(conn.cursor()) as c:
+        c.execute("""SELECT first_name,last_name,department,visit_time
+                     FROM patients
+                     WHERE visit_date=? AND visit_time=?""", (today_iso, target))
+        matches = c.fetchall()
+    if matches:
+        tpl = get_setting("tmpl_alarm_reminder", DEFAULT_TEMPLATES["tmpl_alarm_reminder"])
+        for (fn, ln, dept, _vtime) in matches:
+            body = tpl.format(hasta_ad=fn, hasta_soyad=ln, bolum=dept or "İlgili bölüm")
+            broadcast(body)
+
+# Günlük özet derleme/gönderme
+
+def compute_daily_summary(date_iso:str):
+    # metrikleri hesapla
+    with closing(get_conn()) as conn, closing(conn.cursor()) as c:
+        c.execute("SELECT COUNT(*) FROM patients WHERE visit_date=?", (date_iso,))
+        toplam_hasta = c.fetchone()[0]
+        c.execute("""SELECT COUNT(*) FROM patient_tests t
+                     JOIN patients p ON p.id=t.patient_id
+                     WHERE p.visit_date=? AND t.status='tamamlandi'""", (date_iso,))
+        toplam_tamam = c.fetchone()[0]
+        c.execute("""SELECT COUNT(*) FROM patient_tests t
+                     JOIN patients p ON p.id=t.patient_id
+                     WHERE p.visit_date=? AND t.status='bekliyor'""", (date_iso,))
+        toplam_bekleyen = c.fetchone()[0]
+    return {
+        "toplam_hasta": toplam_hasta,
+        "toplam_tamam": toplam_tamam,
+        "toplam_bekleyen": toplam_bekleyen,
+    }
+
+def build_daily_summary_text(date_iso:str):
+    metrik = compute_daily_summary(date_iso)
+    tpl = get_setting("tmpl_daily_summary", DEFAULT_TEMPLATES["tmpl_daily_summary"])
+    tarih = datetime.strptime(date_iso, "%Y-%m-%d").strftime("%d/%m/%Y")
+    return tpl.format(tarih=tarih, **metrik)
+
+def send_daily_summary_now(date_iso:str):
+    body = build_daily_summary_text(date_iso)
+    broadcast(body)
+
+# Zamanlayıcı döngüsü
+
+def scheduler_loop():
+    last_alarm_tick = ""
     while True:
-        today_iso = datetime.now().strftime("%Y-%m-%d")
-        now_plus_10 = (datetime.now() + timedelta(minutes=10)).strftime("%H:%M")
-        with closing(get_conn()) as conn, closing(conn.cursor()) as c:
-            c.execute("""SELECT first_name,last_name,department,visit_time
-                         FROM patients
-                         WHERE visit_date=? AND visit_time=?""", (today_iso, now_plus_10))
-            matches = c.fetchall()
-        if matches:
-            for (fn, ln, dept, _vtime) in matches:
-                body = (f"📅 Hatırlatma:\n"
-                        f"{fn} {ln}'ın 10 dakika sonra {dept or 'İlgili bölüm'} randevusu var.\n"
-                        f"Lütfen bölüm ile teyit sağlayın ve hastaya eşlik edin.")
-                for staff in list_personnel(active_only=True):
-                    ok, info = send_whatsapp_message(staff[2], body)
-                    log_message(staff[0], body, ok, info)
-        time.sleep(60)
+        hhmm = _hhmm_now()
+        # 1) Alarm kontrolü (her dakika bir kez)
+        if hhmm != last_alarm_tick:
+            check_alarms_once()
+            last_alarm_tick = hhmm
 
-if "alarm_thread_started" not in st.session_state:
-    threading.Thread(target=check_alarms_loop, daemon=True).start()
-    st.session_state.alarm_thread_started = True
+        # 2) Günlük özet planlı gönderim
+        enabled = get_setting("daily_summary_enabled", "1") == "1"
+        target_hhmm = get_setting("daily_summary_time", "18:00")
+        last_sent = get_setting("daily_summary_last_sent", "")
+        today_iso = datetime.now().strftime("%Y-%m-%d")
+        if enabled and hhmm == target_hhmm and last_sent != today_iso:
+            send_daily_summary_now(today_iso)
+            set_setting("daily_summary_last_sent", today_iso)
+
+        time.sleep(5)  # hafif ve sürekli döngü
 
 # ================== THEME / UI POLISH ==================
 def apply_theme(theme_name: str):
@@ -289,18 +380,37 @@ def apply_theme(theme_name: str):
     if css:
         st.markdown(css, unsafe_allow_html=True)
 
-# mini animasyon/hover
+# mini animasyon/hover + Safari küçük düzeltmeler
 st.markdown("""
 <style>
 .main > div { animation: fadeIn .35s ease-in-out; }
 @keyframes fadeIn { from{opacity:0; transform: translateY(6px);} to{opacity:1; transform:none;} }
 button[kind="primary"]:hover { transform: scale(1.03); transition: .15s; }
+/* Safari için: select/dropdown hizalama */
+section[data-testid="stSidebar"] * { -webkit-font-smoothing: antialiased; }
 </style>
 """, unsafe_allow_html=True)
 
-# ================== AUTH (BUGÜN HERKES ADMIN) ==================
+# ================== AUTH ==================
 if "auth" not in st.session_state:
-    st.session_state.auth = {"logged_in": True, "is_admin": True, "username": "admin"}
+    st.session_state.auth = {"logged_in": False, "is_admin": False, "username": None}
+
+# Login ekranı
+if not st.session_state.auth["logged_in"]:
+    st.title("✅ Check-up Takip Sistemi")
+    st.caption("Giriş yapın – bugün için yalnızca admin kullanıcı gereklidir.")
+    with st.form("login_form"):
+        u = st.text_input("Kullanıcı adı", value="")
+        p = st.text_input("Şifre", type="password", value="")
+        submit = st.form_submit_button("Giriş")
+    if submit:
+        if u == ADMIN_USER and p == ADMIN_PASS:
+            st.session_state.auth = {"logged_in": True, "is_admin": True, "username": u}
+            st.success("Giriş başarılı.")
+            st.rerun()
+        else:
+            st.error("Hatalı kullanıcı adı veya şifre.")
+    st.stop()
 
 # ================== APPLY THEME ==================
 apply_theme(get_setting("theme", "Sistem (varsayılan)"))
@@ -314,6 +424,9 @@ with st.sidebar:
     st.subheader("🔌 Sistem")
     st.write("• Twilio:", "✅" if (_twilio_ok and TWILIO_ACCOUNT_SID) else "⚠️ Ayarları kontrol edin")
     st.write("• Tarih:", sel_disp)
+    if st.button("Çıkış Yap"):
+        st.session_state.auth = {"logged_in": False, "is_admin": False, "username": None}
+        st.rerun()
 
     st.divider()
     with st.expander("⚙️ Ayarlar", expanded=False):
@@ -326,6 +439,29 @@ with st.sidebar:
             set_setting("theme", theme)
             st.success("Tema güncellendi.")
             st.rerun()
+
+        st.divider()
+        # --- Günlük Özet ---
+        st.markdown("#### 🕕 Günlük Özet Planı")
+        en = st.toggle("Günlük özet otomatik gönderilsin", value=(get_setting("daily_summary_enabled", "1") == "1"))
+        set_setting("daily_summary_enabled", "1" if en else "0")
+        hh = st.selectbox("Saat", [f"{h:02d}" for h in range(0,24)], index=int(get_setting("daily_summary_time","18:00").split(":")[0]))
+        mm = st.selectbox("Dakika", [f"{m:02d}" for m in range(0,60,5)], index=int(get_setting("daily_summary_time","18:00").split(":")[1])//5)
+        set_setting("daily_summary_time", f"{hh}:{mm}")
+        st.caption(f"Son gönderim: {get_setting('daily_summary_last_sent','-')}")
+
+        st.divider()
+        # --- Mesaj Şablonları ---
+        st.markdown("#### ✉️ Mesaj Şablonları")
+        for key, title in [
+            ("tmpl_auto_update", "Tetkik Güncellemesi"),
+            ("tmpl_alarm_reminder", "Randevu Hatırlatma (10 dk önce)"),
+            ("tmpl_daily_summary", "Günlük Özet")
+        ]:
+            val = st.text_area(title, value=get_setting(key, DEFAULT_TEMPLATES[key]), height=120, key=f"ta_{key}")
+            if st.button(f"Kaydet – {title}", key=f"save_{key}"):
+                set_setting(key, val)
+                st.success("Kaydedildi.")
 
         st.divider()
         # --- Numara yönetimi (opt-in/opt-out) ---
@@ -360,6 +496,28 @@ with st.sidebar:
             except Exception as e:
                 st.error(f"Hata: {e}")
 
+        st.markdown("#### ⬆️ CSV'den Toplu Personel Ekle")
+        st.caption("Sütunlar: name, phone, active (1/0). Başlık zorunlu.")
+        f = st.file_uploader("personnel.csv yükle", type=["csv"], key="up_staff")
+        if f is not None:
+            try:
+                txt = f.read().decode("utf-8")
+                rdr = csv.DictReader(io.StringIO(txt))
+                cnt_ok, cnt_err = 0, 0
+                for row in rdr:
+                    try:
+                        nm = row.get("name", "")
+                        ph = row.get("phone", "")
+                        ac = 1 if str(row.get("active", "1")).strip() in ("1", "true", "True") else 0
+                        upsert_personnel(nm, ph, ac)
+                        cnt_ok += 1
+                    except Exception:
+                        cnt_err += 1
+                st.success(f"Yüklendi: {cnt_ok} kayıt. Hatalı: {cnt_err}.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"CSV okunamadı: {e}")
+
         st.divider()
         st.markdown("#### 🧪 WhatsApp Testi")
         test_to = st.text_input("Test alıcı (+90...)", key="wa_test_to")
@@ -370,19 +528,25 @@ with st.sidebar:
             else:
                 st.error(f"Hata: {info}")
 
+# =============== ZAMANLAYICI BAŞLAT ===============
+if "bg_threads_started" not in st.session_state:
+    threading.Thread(target=scheduler_loop, daemon=True).start()
+    st.session_state.bg_threads_started = True
+
 # ================== MAIN ==================
 st.title("✅ Check-up Takip Sistemi")
 
-tab_hasta, tab_tetkik, tab_ozet, tab_yedek = st.tabs(
+# Sekmeler
+_tab_hasta, _tab_tetkik, _tab_ozet, _tab_yedek = st.tabs(
     ["🧑‍⚕️ Hastalar", "🧪 Tetkik Takibi", "📊 Gün Özeti", "💾 Yedek"]
 )
 
 # -------- 🧑‍⚕️ Hastalar --------
-with tab_hasta:
+with _tab_hasta:
     st.subheader(f"{sel_disp} — Hasta Listesi")
     pts = list_patients(visit_date_iso=sel_iso)
     st.dataframe([{"ID":p[0], "Ad":p[1], "Soyad":p[2], "Alarm Saati":p[6] or "-"} for p in pts],
-                 use_container_width=True)
+                 use_container_width=True, height=360)
 
     st.markdown("### ➕ Hasta Ekle")
     with st.form("frm_add_patient", clear_on_submit=True):
@@ -410,7 +574,7 @@ with tab_hasta:
             st.rerun()
 
 # -------- 🧪 Tetkik Takibi --------
-with tab_tetkik:
+with _tab_tetkik:
     pts_today = list_patients(visit_date_iso=sel_iso)
     if not pts_today:
         st.info("Bu tarih için hasta yok.")
@@ -465,7 +629,7 @@ with tab_tetkik:
                     st.rerun()
 
 # -------- 📊 Gün Özeti --------
-with tab_ozet:
+with _tab_ozet:
     st.subheader(f"{sel_disp} — Gün Özeti")
     pts = list_patients(visit_date_iso=sel_iso)
     if not pts:
@@ -482,12 +646,19 @@ with tab_ozet:
                 "Tamamlanan": ", ".join(done) if done else "-",
                 "Kalan": ", ".join(remain) if remain else "-"
             })
-        st.dataframe(rows, use_container_width=True)
+        st.dataframe(rows, use_container_width=True, height=380)
+
+        st.markdown("### ✉️ Mesaj Olarak Gönder")
+        colx, coly = st.columns([1,3])
+        if colx.button("Bugünün özetini gönder", type="primary"):
+            send_daily_summary_now(sel_iso)
+            st.success("Günlük özet WhatsApp'tan gönderildi.")
+        preview = build_daily_summary_text(sel_iso)
+        coly.text_area("Önizleme", value=preview, height=140)
 
 # -------- 💾 Yedek --------
-with tab_yedek:
-    st.subheader("Yedek / Dışa Aktar (CSV)")
-    col1, col2 = st.columns(2)
+with _tab_yedek:
+    st.subheader("Yedek / Dışa Aktar (CSV & ZIP)")
 
     def _csv(query:str):
         with closing(get_conn()) as conn, closing(conn.cursor()) as c:
@@ -498,17 +669,24 @@ with tab_yedek:
         w = csv.writer(buf); w.writerow(headers); w.writerows(rows)
         return buf.getvalue().encode("utf-8")
 
-    with col1:
-        if st.button("Hastalar CSV", key="dl_pat"):
-            st.download_button("İndir – patients.csv", _csv("SELECT * FROM patients"),
-                               "patients.csv", "text/csv", key="dl_pat_btn")
-        if st.button("Tetkikler CSV", key="dl_tests"):
-            st.download_button("İndir – patient_tests.csv", _csv("SELECT * FROM patient_tests"),
-                               "patient_tests.csv", "text/csv", key="dl_tests_btn")
-    with col2:
-        if st.button("Personel CSV", key="dl_staff"):
-            st.download_button("İndir – personnel.csv", _csv("SELECT * FROM personnel"),
-                               "personnel.csv", "text/csv", key="dl_staff_btn")
-        if st.button("Mesaj Logları CSV", key="dl_logs"):
-            st.download_button("İndir – msg_logs.csv", _csv("SELECT * FROM msg_logs"),
-                               "msg_logs.csv", "text/csv", key="dl_logs_btn")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button("İndir – patients.csv", _csv("SELECT * FROM patients"),
+                           "patients.csv", "text/csv", key="dl_pat_btn")
+        st.download_button("İndir – patient_tests.csv", _csv("SELECT * FROM patient_tests"),
+                           "patient_tests.csv", "text/csv", key="dl_tests_btn")
+    with c2:
+        st.download_button("İndir – personnel.csv", _csv("SELECT * FROM personnel"),
+                           "personnel.csv", "text/csv", key="dl_staff_btn")
+        st.download_button("İndir – msg_logs.csv", _csv("SELECT * FROM msg_logs"),
+                           "msg_logs.csv", "text/csv", key="dl_logs_btn")
+
+    st.markdown("#### 📦 Tüm tabloları tek tıkla (ZIP)")
+    zip_bytes = io.BytesIO()
+    with zipfile.ZipFile(zip_bytes, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("patients.csv", _csv("SELECT * FROM patients"))
+        zf.writestr("patient_tests.csv", _csv("SELECT * FROM patient_tests"))
+        zf.writestr("personnel.csv", _csv("SELECT * FROM personnel"))
+        zf.writestr("msg_logs.csv", _csv("SELECT * FROM msg_logs"))
+    zip_bytes.seek(0)
+    st.download_button("İndir – checkup_backup.zip", zip_bytes, file_name="checkup_backup.zip", mime="application/zip")
