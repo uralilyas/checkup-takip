@@ -10,12 +10,34 @@ DB_PATH = "checkup.db"
 TZ = "Europe/Istanbul"  # bilgilendirme amaçlı; sistem saatini kullanıyoruz
 
 # ---- Ortam değişkenleri ----
-TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
-TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
-TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM", "")  # +14155238886 veya whatsapp:+14155238886 (sandbox/prod)
+# Streamlit Cloud'da "Secrets" üzerinden geliyorsa önce oradan, yoksa ortam değişkeninden oku
 
-ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
-ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin123")
+def _get_secret_or_env(key: str, default: str = "") -> str:
+    try:
+        if hasattr(st, "secrets") and key in st.secrets:
+            val = st.secrets.get(key)
+            if val is not None and str(val).strip() != "":
+                return str(val).strip()
+    except Exception:
+        pass
+    return str(os.environ.get(key, default) or "").strip()
+
+def _source_of(key: str) -> str:
+    try:
+        if hasattr(st, "secrets") and key in st.secrets and str(st.secrets.get(key) or "").strip() != "":
+            return "secrets"
+    except Exception:
+        pass
+    if os.environ.get(key):
+        return "env"
+    return "default"
+
+TWILIO_ACCOUNT_SID = _get_secret_or_env("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN = _get_secret_or_env("TWILIO_AUTH_TOKEN", "")
+TWILIO_WHATSAPP_FROM = _get_secret_or_env("TWILIO_WHATSAPP_FROM", "")  # +1415... ya da whatsapp:+1415...
+
+ADMIN_USER = _get_secret_or_env("ADMIN_USER", "admin")
+ADMIN_PASS = _get_secret_or_env("ADMIN_PASS", "admin123")
 
 try:
     from twilio.rest import Client
@@ -400,8 +422,8 @@ if not st.session_state.auth["logged_in"]:
     st.title("✅ Check-up Takip Sistemi")
     st.caption("Giriş yapın – bugün için yalnızca admin kullanıcı gereklidir.")
     with st.form("login_form"):
-        u = st.text_input("Kullanıcı adı", value="")
-        p = st.text_input("Şifre", type="password", value="")
+        u = st.text_input("Kullanıcı adı", value="").strip()
+        p = st.text_input("Şifre", type="password", value="").strip()
         submit = st.form_submit_button("Giriş")
     if submit:
         if u == ADMIN_USER and p == ADMIN_PASS:
@@ -410,6 +432,12 @@ if not st.session_state.auth["logged_in"]:
             st.rerun()
         else:
             st.error("Hatalı kullanıcı adı veya şifre.")
+    # Geçici debug: gizli değerleri ifşa etmeden kaynak/uzunluk göster
+    dbg = st.checkbox("🔧 Geliştirici modu (geçici)")
+    if dbg:
+        st.caption(f"ADMIN_USER kaynağı: {_source_of('ADMIN_USER')} | değer: '{ADMIN_USER}'")
+        st.caption(f"ADMIN_PASS kaynağı: {_source_of('ADMIN_PASS')} | uzunluk: {len(ADMIN_PASS) if ADMIN_PASS else 0}")
+        st.caption("Not: Parola içeriği gösterilmez; yalnızca uzunluk görüntülenir.")
     st.stop()
 
 # ================== APPLY THEME ==================
