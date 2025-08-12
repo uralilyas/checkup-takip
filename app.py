@@ -334,24 +334,40 @@ tab_hasta, tab_tetkik, tab_paket, tab_ozet, tab_yedek = st.tabs(
     ["🧑‍⚕️ Hastalar","🧪 Tetkik Takibi","📦 Paketler","📊 Gün Özeti","💾 Yedek"]
 )
 
-# -------- Hastalar (sabit tablo + hızlı ekleme) --------
+# -------- Hastalar (sabit tablo + hızlı ekleme + İSTEĞE BAĞLI paket seçimi) --------
 with tab_hasta:
     st.subheader(f"{sel_disp} — Hasta Listesi")
     pts=list_patients(sel_iso)
     st.table([{"ID":p[0],"Ad":p[1],"Soyad":p[2],"Cinsiyet":p[4] or "","Yaş":p[3] or "","Alarm":p[6] or "-"} for p in pts])
 
     st.markdown("### ➕ Hızlı Ekle")
+    pkgs_all = list_packages()
+    pkg_opts = [(k,n) for k,n in pkgs_all]
     with st.form("quick_add", clear_on_submit=True):
         c1,c2,c3 = st.columns([3,2,2])
         fullname=c1.text_input("Ad Soyad")
         gender=c2.selectbox("Cinsiyet", ["Kadın","Erkek","Diğer"])
         age=c3.number_input("Yaş",0,120,0)
+
+        # İSTEĞE BAĞLI paket seçimi (çoklu)
+        st.markdown("**📦 Paket seç (isteğe bağlı)**")
+        sel_pkgs = st.multiselect("Hazır paketlerden seçebilirsiniz", pkg_opts, format_func=lambda x:x[1])
+
         ok=st.form_submit_button("Ekle")
     if ok:
         if not fullname.strip(): st.warning("Ad Soyad gerekli.")
         else:
             parts=fullname.split(); fn=" ".join(parts[:-1]) if len(parts)>1 else parts[0]; ln=parts[-1] if len(parts)>1 else "-"
-            add_patient(fn,ln,int(age),gender,sel_iso); st.success("Eklendi"); st.rerun()
+            add_patient(fn,ln,int(age),gender,sel_iso)
+            # yeni hastanın id'si
+            pts2=list_patients(sel_iso)
+            new_id=max([p[0] for p in pts2]) if pts2 else None
+            # seçili paketleri uygula
+            if new_id and sel_pkgs:
+                for pid,name in sel_pkgs:
+                    apply_package_to_patient(pid, new_id)
+            st.success("Hasta eklendi" + (f" (+ {len(sel_pkgs)} paket uygulandı)" if sel_pkgs else ""))
+            st.rerun()
 
     if pts:
         st.markdown("### 🗑️ Hasta Sil")
@@ -386,7 +402,7 @@ with tab_tetkik:
                 else: st.success("Tetkik eklendi.")
                 st.rerun()
 
-        # Paket Ata (paket içeriği güzel görünüm)
+        # Paket Ata + estetik içerik
         st.markdown("#### Paket Ata")
         pkgs=list_packages()
         if pkgs:
@@ -395,13 +411,11 @@ with tab_tetkik:
             if cbtn.button("Paketi uygula"):
                 apply_package_to_patient(pkg_sel[0], pid)
                 st.success(f"'{pkg_sel[1]}' paketi eklendi."); st.rerun()
-
             with st.expander("Paket içeriği"):
                 items=get_package_tests(pkg_sel[0])
                 if not items:
                     st.info("Paket boş.")
                 else:
-                    # Şık chip'lerle göster
                     st.markdown('<div class="pkg-card">', unsafe_allow_html=True)
                     cols = st.columns(2)
                     half = (len(items)+1)//2
@@ -470,7 +484,7 @@ with tab_paket:
     pkgs=list_packages()
     col_a, col_b = st.columns([2,2])
 
-    # Yeni paket oluşturma (çok satırlı girdi)
+    # Yeni paket (çok satırlı girdi)
     with col_a:
         st.markdown("### ➕ Yeni Paket")
         with st.form("pkg_new", clear_on_submit=True):
@@ -494,11 +508,9 @@ with tab_paket:
 
             st.markdown("**Paket İçeriği**")
             items=get_package_tests(sel_pkg[0])
-            # Estetik chip görünümü + sil
             if items:
                 st.markdown('<div class="pkg-card">', unsafe_allow_html=True)
                 for idx,(pt_id,test_name,_ord) in enumerate(items, start=1):
-                    # her chip yanında sil butonu için küçük form
                     cols=st.columns([6,1])
                     with cols[0]:
                         st.markdown(f'<span class="pkg-chip">{idx}. {test_name}</span>', unsafe_allow_html=True)
@@ -518,7 +530,6 @@ with tab_paket:
                 lines=[l.strip() for l in bulk.splitlines() if l.strip()]
                 if not lines: st.warning("En az bir satır girin.")
                 else:
-                    # sıra numarasını doğru artır
                     base_ord=len(items)
                     for i,name in enumerate(lines):
                         add_test_to_package(sel_pkg[0], name, ord_hint=base_ord+i)
@@ -573,7 +584,6 @@ with tab_ozet:
         st.table(rows)
         st.caption(f"Toplam tamamlanan: {total_done} • Kalan: {total_rem}")
 
-        # Randevusu olup kalan tetkiki bulunanlar için toplu .ics
         with_time=[p for p in pts if p[6] and any(t[3]=="bekliyor" for t in list_patient_tests(p[0]))]
         if with_time:
             mem=io.BytesIO()
