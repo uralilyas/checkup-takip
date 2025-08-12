@@ -1,16 +1,16 @@
 # app.py
-import sqlite3, csv, io, zipfile
+import sqlite3, csv, io, zipfile, os
 from datetime import datetime, date, timedelta
 from contextlib import closing
 from urllib.parse import quote_plus
 from zoneinfo import ZoneInfo
 import streamlit as st
 
-# =================== CONFIG ===================
+# =============== CONFIG ===============
 st.set_page_config(page_title="Check-up Takip", page_icon="🩺", layout="wide")
 DB_PATH = "checkup.db"
 TR_TZ = ZoneInfo("Europe/Istanbul")
-AUTH_ENABLED = False  # True yaparsan giriş: admin/admin
+AUTH_ENABLED = False  # True -> giriş: admin/admin
 
 def now_tr(): return datetime.now(TR_TZ)
 def today_tr_date(): n=now_tr(); return date(n.year,n.month,n.day)
@@ -22,11 +22,12 @@ def normalize_phone(p:str)->str:
     if p and not p.startswith("+"): p="+"+p
     return p
 
-# =================== DB ===================
+# =============== DB ===============
 def get_conn(): return sqlite3.connect(DB_PATH, check_same_thread=False)
 def column_exists(conn,t,c)->bool:
     with closing(conn.cursor()) as cur:
-        cur.execute(f"PRAGMA table_info({t})"); return any(r[1]==c for r in cur.fetchall())
+        cur.execute(f"PRAGMA table_info({t})")
+        return any(r[1]==c for r in cur.fetchall())
 
 def init_db():
     with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
@@ -43,6 +44,7 @@ def init_db():
             age INTEGER, gender TEXT,
             visit_date TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT (datetime('now')))""")
+        # Onarım/şema yükseltme
         if not column_exists(conn,"patients","department"):
             c.execute("ALTER TABLE patients ADD COLUMN department TEXT")
             c.execute("UPDATE patients SET department='Genel' WHERE department IS NULL")
@@ -54,7 +56,6 @@ def init_db():
             status TEXT NOT NULL DEFAULT 'bekliyor',
             updated_at TEXT NOT NULL DEFAULT (datetime('now')),
             FOREIGN KEY(patient_id) REFERENCES patients(id))""")
-        # Paketler
         c.execute("""CREATE TABLE IF NOT EXISTS packages(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL UNIQUE,
@@ -65,9 +66,20 @@ def init_db():
             test_name TEXT NOT NULL,
             ord INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY(package_id) REFERENCES packages(id))""")
-init_db()
 
-# =================== SETTINGS HELPERS ===================
+def cleanup_old_patients():  # dünkü ve daha eski hastaları sil, paketlere dokunma
+    today_iso = to_iso(today_tr_date())
+    with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
+        c.execute("SELECT id FROM patients WHERE visit_date < ?", (today_iso,))
+        old_ids = [r[0] for r in c.fetchall()]
+        if old_ids:
+            c.executemany("DELETE FROM patient_tests WHERE patient_id=?", [(i,) for i in old_ids])
+            c.executemany("DELETE FROM patients WHERE id=?", [(i,) for i in old_ids])
+
+init_db()
+cleanup_old_patients()
+
+# =============== SETTINGS HELPERS ===============
 def get_setting(key, default=""):
     with closing(get_conn()) as conn, closing(conn.cursor()) as c:
         c.execute("SELECT val FROM app_settings WHERE key=?", (key,))
@@ -77,7 +89,7 @@ def set_setting(key,val):
         c.execute("""INSERT INTO app_settings(key,val) VALUES(?,?)
                      ON CONFLICT(key) DO UPDATE SET val=excluded.val""",(key,val))
 
-# =================== PERSONNEL ===================
+# =============== PERSONNEL ===============
 def list_personnel(active_only=True):
     with closing(get_conn()) as conn, closing(conn.cursor()) as c:
         q="SELECT id,name,phone,active FROM personnel"
@@ -101,7 +113,7 @@ def delete_personnel(pid:int):
     with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
         c.execute("DELETE FROM personnel WHERE id=?", (pid,))
 
-# =================== PATIENTS / TESTS ===================
+# =============== PATIENTS / TESTS ===============
 def add_patient(fn,ln,age,gender,visit_date_iso):
     with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
         c.execute("""INSERT INTO patients(first_name,last_name,age,gender,visit_date,department,visit_time)
@@ -138,7 +150,7 @@ def delete_patient_test(tid:int):
     with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
         c.execute("DELETE FROM patient_tests WHERE id=?", (tid,))
 
-# =================== PACKAGES ===================
+# =============== PACKAGES ===============
 def list_packages():
     with closing(get_conn()) as conn, closing(conn.cursor()) as c:
         c.execute("SELECT id,name FROM packages ORDER BY name"); return c.fetchall()
@@ -176,7 +188,7 @@ def apply_package_to_patient(pkg_id:int, patient_id:int):
     for _id, name, _ord in tests:
         add_patient_test(patient_id, name)
 
-# =================== CALENDAR / WHATSAPP ===================
+# =============== CALENDAR / WHATSAPP ===============
 def build_ics(patient_name:str, visit_date_iso:str, hhmm:str,
               duration_min:int=30, remind_min:int=10, location:str="Klinik")->bytes:
     dt_local=datetime.strptime(f"{visit_date_iso} {hhmm}","%Y-%m-%d %H:%M").replace(tzinfo=TR_TZ)
@@ -217,7 +229,7 @@ def google_calendar_link(patient_name, visit_date_iso, hhmm, duration_min:int=30
 def make_whatsapp_link(phone,text)->str:
     return f"https://wa.me/{normalize_phone(phone).replace('+','')}?text={quote_plus(text)}"
 
-# =================== THEME & EFFECTS ===================
+# =============== THEME & EFFECTS ===============
 def apply_theme(theme_name:str):
     THEMES={
         "Sistemle Uyumlu": """
@@ -247,7 +259,7 @@ def apply_theme(theme_name:str):
         body,.stApp{ background:#f5fffb!important; color:#0f172a!important;}
         </style>"""
     }
-    css=THEMES.get(theme_name,""); 
+    css=THEMES.get(theme_name,"")
     if css: st.markdown(css, unsafe_allow_html=True)
 
 st.markdown("""
@@ -257,15 +269,13 @@ section.main > div { animation: fadeIn .35s ease-in-out; }
 .stButton>button,.stDownloadButton>button,.stLinkButton>button{ padding:.72rem 1rem!important; font-weight:600!important; border-radius:12px!important; transition:transform .15s ease, filter .15s ease;}
 .stButton>button:hover,.stDownloadButton>button:hover,.stLinkButton>button:hover{ transform:translateY(-1px); filter:saturate(1.05);}
 
-/* Estetik Paket Kartları & Chip görünümü */
+/* Paket kart/chip */
 .pkg-card{ border:1px solid var(--border); background:var(--card); border-radius:14px; padding:12px 14px; margin:8px 0; }
 .pkg-chip{ display:inline-block; padding:.35rem .6rem; border-radius:999px; background:var(--chip-bg); color:var(--chip-tx); margin:.22rem .28rem .22rem 0; font-size:.92rem; }
-.pkg-chip .rm{ margin-left:.45rem; opacity:.7; cursor:pointer; }
-.pkg-chip .rm:hover{ opacity:1; text-decoration:underline; }
 </style>
 """, unsafe_allow_html=True)
 
-# =================== AUTH (opsiyonel) ===================
+# =============== AUTH (opsiyonel) ===============
 def do_login_ui():
     st.title("🩺 Check-up Takip")
     with st.form("login_form"):
@@ -277,16 +287,15 @@ def do_login_ui():
             st.session_state.auth={"logged_in":True,"user":"admin"}
             st.experimental_rerun()
         else: st.error("Geçersiz bilgiler.")
-
 if "auth" not in st.session_state:
     st.session_state.auth={"logged_in": (not AUTH_ENABLED), "user":"admin"}
 if AUTH_ENABLED and not st.session_state.auth["logged_in"]:
     do_login_ui(); st.stop()
 
-# =================== THEME APPLY ===================
+# =============== THEME APPLY ===============
 apply_theme(get_setting("theme","Sistemle Uyumlu"))
 
-# =================== SIDEBAR ===================
+# =============== SIDEBAR ===============
 picked_date=st.sidebar.date_input("📅 Tarih", value=today_tr_date())
 sel_iso=to_iso(picked_date); sel_disp=to_display(picked_date)
 
@@ -328,13 +337,13 @@ with st.sidebar:
         sel=st.selectbox("Kişi seç", opts, index=idx)
         if st.button("Kaydet"): set_setting("default_recipient", sel[0] if sel[0] else ""); st.success("Kaydedildi")
 
-# =================== MAIN ===================
+# =============== MAIN ===============
 st.title("🩺 Check-up Takip Sistemi")
 tab_hasta, tab_tetkik, tab_paket, tab_ozet, tab_yedek = st.tabs(
     ["🧑‍⚕️ Hastalar","🧪 Tetkik Takibi","📦 Paketler","📊 Gün Özeti","💾 Yedek"]
 )
 
-# -------- Hastalar (sabit tablo + hızlı ekleme + İSTEĞE BAĞLI paket seçimi) --------
+# ---- Hastalar (sabit tablo + hızlı ekleme + isteğe bağlı paket) ----
 with tab_hasta:
     st.subheader(f"{sel_disp} — Hasta Listesi")
     pts=list_patients(sel_iso)
@@ -348,25 +357,27 @@ with tab_hasta:
         fullname=c1.text_input("Ad Soyad")
         gender=c2.selectbox("Cinsiyet", ["Kadın","Erkek","Diğer"])
         age=c3.number_input("Yaş",0,120,0)
-
-        # İSTEĞE BAĞLI paket seçimi (çoklu)
         st.markdown("**📦 Paket seç (isteğe bağlı)**")
         sel_pkgs = st.multiselect("Hazır paketlerden seçebilirsiniz", pkg_opts, format_func=lambda x:x[1])
-
         ok=st.form_submit_button("Ekle")
     if ok:
-        if not fullname.strip(): st.warning("Ad Soyad gerekli.")
+        if not fullname.strip():
+            st.warning("Ad Soyad gerekli.")
         else:
-            parts=fullname.split(); fn=" ".join(parts[:-1]) if len(parts)>1 else parts[0]; ln=parts[-1] if len(parts)>1 else "-"
-            add_patient(fn,ln,int(age),gender,sel_iso)
-            # yeni hastanın id'si
+            parts=fullname.split()
+            fn=" ".join(parts[:-1]) if len(parts)>1 else parts[0]
+            ln=parts[-1] if len(parts)>1 else "-"
+            try:
+                add_patient(fn, ln, int(age), gender, sel_iso)
+            except sqlite3.IntegrityError:
+                init_db()
+                add_patient(fn, ln, int(age), gender, sel_iso)
             pts2=list_patients(sel_iso)
             new_id=max([p[0] for p in pts2]) if pts2 else None
-            # seçili paketleri uygula
             if new_id and sel_pkgs:
-                for pid,name in sel_pkgs:
-                    apply_package_to_patient(pid, new_id)
-            st.success("Hasta eklendi" + (f" (+ {len(sel_pkgs)} paket uygulandı)" if sel_pkgs else ""))
+                for pid_pkg,_ in sel_pkgs:
+                    apply_package_to_patient(pid_pkg, new_id)
+            st.success("Hasta eklendi" + (f" (+ {len(sel_pkgs)} paket)" if sel_pkgs else ""))
             st.rerun()
 
     if pts:
@@ -374,7 +385,7 @@ with tab_hasta:
         choice=st.selectbox("Silinecek", [(p[0], f"{p[1]} {p[2]}") for p in pts], format_func=lambda x:x[1], key="del_pt_sel")
         if st.button("Sil"): delete_patient(choice[0]); st.success("Silindi"); st.rerun()
 
-# -------- Tetkik Takibi --------
+# ---- Tetkik Takibi ----
 with tab_tetkik:
     pts_today=list_patients(sel_iso)
     if not pts_today: st.info("Bu tarihte hasta yok.")
@@ -402,7 +413,6 @@ with tab_tetkik:
                 else: st.success("Tetkik eklendi.")
                 st.rerun()
 
-        # Paket Ata + estetik içerik
         st.markdown("#### Paket Ata")
         pkgs=list_packages()
         if pkgs:
@@ -413,8 +423,7 @@ with tab_tetkik:
                 st.success(f"'{pkg_sel[1]}' paketi eklendi."); st.rerun()
             with st.expander("Paket içeriği"):
                 items=get_package_tests(pkg_sel[0])
-                if not items:
-                    st.info("Paket boş.")
+                if not items: st.info("Paket boş.")
                 else:
                     st.markdown('<div class="pkg-card">', unsafe_allow_html=True)
                     cols = st.columns(2)
@@ -422,12 +431,10 @@ with tab_tetkik:
                     left = items[:half]; right = items[half:]
                     def _render(col, arr):
                         with col:
-                            for idx,(pt_id, test_name, ord_) in enumerate(arr, start=1):
-                                st.markdown(f'<span class="pkg-chip">{idx}. {test_name}</span>', unsafe_allow_html=True)
+                            for idx,(_ptid, tname, _o) in enumerate(arr, start=1):
+                                st.markdown(f'<span class="pkg-chip">{idx}. {tname}</span>', unsafe_allow_html=True)
                     _render(cols[0], left); _render(cols[1], right)
                     st.markdown('</div>', unsafe_allow_html=True)
-        else:
-            st.info("Önce Paketler sekmesinden paket oluşturun.")
 
         st.markdown("#### Tetkikler")
         trs=list_patient_tests(pid)
@@ -438,11 +445,9 @@ with tab_tetkik:
             tpl=get_setting("wa_template","Hasta: {patient} ({date})\nTamamlanan: {done}\nKalan: {remaining}")
             msg=tpl.format(patient=patient_name, date=sel_disp,
                            done=", ".join(done) if done else "-", remaining=", ".join(rem) if rem else "-")
-
             active_people=list_personnel(active_only=True)
             receivers=[(p[2], f"{p[1]} — {p[2]}") for p in active_people]
             default_phone=get_setting("default_recipient", receivers[0][0] if receivers else "")
-
             cwa,cics=st.columns([2,2])
             with cwa:
                 st.markdown("**💬 WhatsApp**")
@@ -454,7 +459,6 @@ with tab_tetkik:
                     multi=st.multiselect("Çoklu alıcı", receivers, format_func=lambda x:x[1], key="wa_multi")
                     for ph,label in multi: st.link_button(f"{label}’a gönder", make_whatsapp_link(ph, msg))
                 with st.popover("Mesajı kopyala"): st.code(msg, language=None)
-
             with cics:
                 if visit_hhmm:
                     rem_min=st.selectbox("Alarm süresi", [5,10,15,30], index=1)
@@ -465,7 +469,6 @@ with tab_tetkik:
                     st.link_button("🗓️ Google Calendar", google_calendar_link(patient_name, sel_iso, visit_hhmm))
                 else:
                     st.info("Alarm saati yok. Tetkik eklerken 'Alarm kur' ile belirleyebilirsin.")
-
             st.divider()
             for tid,_pid,name,status,upd in trs:
                 icon="✅" if status=="tamamlandi" else "⏳"
@@ -477,14 +480,11 @@ with tab_tetkik:
                     if c3.button("Geri Al", key=f"undo_{tid}"): update_patient_test_status(tid,"bekliyor"); st.rerun()
                 if c4.button("Sil", key=f"del_{tid}"): delete_patient_test(tid); st.rerun()
 
-# -------- Paketler (CRUD + estetik içerik + çok satırlı ekleme) --------
+# ---- Paketler (CRUD + çok satırlı ekleme) ----
 with tab_paket:
     st.subheader("📦 Check‑up Paketleri")
-
     pkgs=list_packages()
     col_a, col_b = st.columns([2,2])
-
-    # Yeni paket (çok satırlı girdi)
     with col_a:
         st.markdown("### ➕ Yeni Paket")
         with st.form("pkg_new", clear_on_submit=True):
@@ -498,14 +498,11 @@ with tab_paket:
             else:
                 try: create_package(name, tests); st.success("Paket oluşturuldu"); st.rerun()
                 except Exception as e: st.error(f"Hata: {e}")
-
         st.markdown("### ✏️ Paket Düzenle")
         if pkgs:
             sel_pkg=st.selectbox("Paket seç", [(k,n) for k,n in pkgs], format_func=lambda x:x[1], key="pkg_edit_sel")
             new_name=st.text_input("Yeni ad", value=sel_pkg[1], key="pkg_new_name")
-            if st.button("Adı Güncelle"):
-                rename_package(sel_pkg[0], new_name); st.success("Güncellendi"); st.rerun()
-
+            if st.button("Adı Güncelle"): rename_package(sel_pkg[0], new_name); st.success("Güncellendi"); st.rerun()
             st.markdown("**Paket İçeriği**")
             items=get_package_tests(sel_pkg[0])
             if items:
@@ -519,8 +516,6 @@ with tab_paket:
                 st.markdown('</div>', unsafe_allow_html=True)
             else:
                 st.info("Bu paket henüz boş.")
-
-            # Çok satırlı toplu ekleme
             st.markdown("**Tetkik Ekle (çok satırlı)**")
             with st.form("pkg_add_tests_multi", clear_on_submit=True):
                 bulk=st.text_area("Her satır bir tetkik olacak şekilde giriniz", height=120,
@@ -536,14 +531,11 @@ with tab_paket:
                     st.success(f"{len(lines)} tetkik eklendi."); st.rerun()
         else:
             st.info("Henüz paket yok.")
-
     with col_b:
         st.markdown("### 🗑️ Paket Sil")
         if pkgs:
             del_sel=st.selectbox("Silinecek paket", [(k,n) for k,n in pkgs], format_func=lambda x:x[1], key="pkg_del_sel")
-            if st.button("Paketi Sil"):
-                delete_package(del_sel[0]); st.success("Silindi"); st.rerun()
-
+            if st.button("Paketi Sil"): delete_package(del_sel[0]); st.success("Silindi"); st.rerun()
         st.markdown("### ↕️ Paket Dışa/İçe Aktar (CSV)")
         def _csv_packages():
             with closing(get_conn()) as conn, closing(conn.cursor()) as c:
@@ -568,7 +560,7 @@ with tab_paket:
                     if pid: add_test_to_package(pid, r["name_or_test"])
             st.success("İçe aktarıldı"); st.rerun()
 
-# -------- Gün Özeti (sabit tablo) --------
+# ---- Gün Özeti ----
 with tab_ozet:
     st.subheader(f"{sel_disp} — Gün Özeti")
     pts=list_patients(sel_iso)
@@ -583,7 +575,6 @@ with tab_ozet:
             rows.append({"Hasta": f"{p[1]} {p[2]}", "Tamamlanan": ", ".join(done) if done else "-", "Kalan": ", ".join(rem) if rem else "-"})
         st.table(rows)
         st.caption(f"Toplam tamamlanan: {total_done} • Kalan: {total_rem}")
-
         with_time=[p for p in pts if p[6] and any(t[3]=="bekliyor" for t in list_patient_tests(p[0]))]
         if with_time:
             mem=io.BytesIO()
@@ -595,7 +586,7 @@ with tab_ozet:
             st.download_button("📦 Kalan tetkiki olanların randevuları (.zip)", mem,
                                file_name=f"{sel_iso}_randevular_kalan.zip", mime="application/zip")
 
-# -------- Yedek --------
+# ---- Yedek ----
 with tab_yedek:
     st.subheader("Dışa Aktar (CSV)")
     def _csv(q):
