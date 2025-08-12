@@ -1,19 +1,20 @@
 # app.py
-import sqlite3, csv, io, zipfile, os
+# Check-up Takip Sistemi — tek dosya, Streamlit
+import sqlite3, csv, io, zipfile
 from datetime import datetime, date, timedelta
 from contextlib import closing
 from urllib.parse import quote_plus
 from zoneinfo import ZoneInfo
 import streamlit as st
 
-# =============== CONFIG ===============
+# ================== CONFIG ==================
 st.set_page_config(page_title="Check-up Takip", page_icon="🩺", layout="wide")
 DB_PATH = "checkup.db"
 TR_TZ = ZoneInfo("Europe/Istanbul")
-AUTH_ENABLED = False  # True -> giriş: admin/admin
+AUTH_ENABLED = False  # True yaparsan giriş ekranı: admin/admin
 
 def now_tr(): return datetime.now(TR_TZ)
-def today_tr_date(): n=now_tr(); return date(n.year,n.month,n.day)
+def today_tr_date(): n=now_tr(); return date(n.year, n.month, n.day)
 def to_iso(d:date)->str: return d.strftime("%Y-%m-%d")
 def to_display(d:date)->str: return d.strftime("%d/%m/%Y")
 def now_str()->str: return now_tr().strftime("%Y-%m-%d %H:%M:%S")
@@ -22,7 +23,7 @@ def normalize_phone(p:str)->str:
     if p and not p.startswith("+"): p="+"+p
     return p
 
-# =============== DB ===============
+# ================== DB ==================
 def get_conn(): return sqlite3.connect(DB_PATH, check_same_thread=False)
 def column_exists(conn,t,c)->bool:
     with closing(conn.cursor()) as cur:
@@ -44,12 +45,17 @@ def init_db():
             age INTEGER, gender TEXT,
             visit_date TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT (datetime('now')))""")
-        # Onarım/şema yükseltme
+        # --- Şema onarımları / yükseltmeler ---
         if not column_exists(conn,"patients","department"):
             c.execute("ALTER TABLE patients ADD COLUMN department TEXT")
             c.execute("UPDATE patients SET department='Genel' WHERE department IS NULL")
         if not column_exists(conn,"patients","visit_time"):
             c.execute("ALTER TABLE patients ADD COLUMN visit_time TEXT")
+        # created_at NULL ise doldur (eski kayıtlardan gelebilir)
+        try:
+            c.execute("UPDATE patients SET created_at = COALESCE(created_at, datetime('now'))")
+        except sqlite3.OperationalError:
+            pass
         c.execute("""CREATE TABLE IF NOT EXISTS patient_tests(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             patient_id INTEGER NOT NULL, test_name TEXT NOT NULL,
@@ -67,34 +73,37 @@ def init_db():
             ord INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY(package_id) REFERENCES packages(id))""")
 
-def cleanup_old_patients():  # dünkü ve daha eski hastaları sil, paketlere dokunma
+def cleanup_old_patients():
+    """Dünkü ve öncesi hastaları (ve onların tetkiklerini) sil. Paketlere dokunma."""
     today_iso = to_iso(today_tr_date())
     with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
         c.execute("SELECT id FROM patients WHERE visit_date < ?", (today_iso,))
-        old_ids = [r[0] for r in c.fetchall()]
-        if old_ids:
-            c.executemany("DELETE FROM patient_tests WHERE patient_id=?", [(i,) for i in old_ids])
-            c.executemany("DELETE FROM patients WHERE id=?", [(i,) for i in old_ids])
+        ids=[r[0] for r in c.fetchall()]
+        if ids:
+            c.executemany("DELETE FROM patient_tests WHERE patient_id=?", [(i,) for i in ids])
+            c.executemany("DELETE FROM patients WHERE id=?", [(i,) for i in ids])
 
 init_db()
 cleanup_old_patients()
 
-# =============== SETTINGS HELPERS ===============
+# ================== SETTINGS HELPERS ==================
 def get_setting(key, default=""):
     with closing(get_conn()) as conn, closing(conn.cursor()) as c:
         c.execute("SELECT val FROM app_settings WHERE key=?", (key,))
-        r=c.fetchone(); return r[0] if r else default
+        r=c.fetchone()
+        return r[0] if r else default
 def set_setting(key,val):
     with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
         c.execute("""INSERT INTO app_settings(key,val) VALUES(?,?)
                      ON CONFLICT(key) DO UPDATE SET val=excluded.val""",(key,val))
 
-# =============== PERSONNEL ===============
+# ================== PERSONNEL ==================
 def list_personnel(active_only=True):
     with closing(get_conn()) as conn, closing(conn.cursor()) as c:
         q="SELECT id,name,phone,active FROM personnel"
         if active_only: q+=" WHERE active=1"
-        q+=" ORDER BY name"; c.execute(q); return c.fetchall()
+        q+=" ORDER BY name"
+        c.execute(q); return c.fetchall()
 def upsert_personnel(name,phone,active:int):
     phone=normalize_phone(phone)
     if not phone.startswith("+"): raise ValueError("Telefon +90… formatında olmalı")
@@ -102,7 +111,7 @@ def upsert_personnel(name,phone,active:int):
         c.execute("SELECT id FROM personnel WHERE phone=?", (phone,))
         r=c.fetchone()
         if r:
-            c.execute("UPDATE personnel SET name=?,active=? WHERE id=?", (name.strip(),active,r[0]))
+            c.execute("UPDATE personnel SET name=?,active=? WHERE id=?",(name.strip(),active,r[0]))
             return r[0]
         c.execute("INSERT INTO personnel(name,phone,active) VALUES(?,?,?)",(name.strip(),phone,active))
         return c.lastrowid
@@ -113,11 +122,17 @@ def delete_personnel(pid:int):
     with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
         c.execute("DELETE FROM personnel WHERE id=?", (pid,))
 
-# =============== PATIENTS / TESTS ===============
-def add_patient(fn,ln,age,gender,visit_date_iso):
+# ================== PATIENTS / TESTS ==================
+def add_patient(fn, ln, age, gender, visit_date_iso):
+    """created_at’i de doldurarak ekler (IntegrityError fix)."""
     with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
-        c.execute("""INSERT INTO patients(first_name,last_name,age,gender,visit_date,department,visit_time)
-                     VALUES(?,?,?,?,?,?,?)""",(fn.strip(),ln.strip(),age,gender,visit_date_iso,"Genel",None))
+        c.execute("""
+            INSERT INTO patients(
+                first_name,last_name,age,gender,visit_date,
+                department,visit_time,created_at
+            ) VALUES (?,?,?,?,?,?,?,?)
+        """, (fn.strip(), ln.strip(), age, gender,
+              visit_date_iso, "Genel", None, now_str()))
 def delete_patient(pid:int):
     with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
         c.execute("DELETE FROM patient_tests WHERE patient_id=?", (pid,))
@@ -150,7 +165,7 @@ def delete_patient_test(tid:int):
     with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
         c.execute("DELETE FROM patient_tests WHERE id=?", (tid,))
 
-# =============== PACKAGES ===============
+# ================== PACKAGES ==================
 def list_packages():
     with closing(get_conn()) as conn, closing(conn.cursor()) as c:
         c.execute("SELECT id,name FROM packages ORDER BY name"); return c.fetchall()
@@ -188,7 +203,7 @@ def apply_package_to_patient(pkg_id:int, patient_id:int):
     for _id, name, _ord in tests:
         add_patient_test(patient_id, name)
 
-# =============== CALENDAR / WHATSAPP ===============
+# ================== CALENDAR / WA ==================
 def build_ics(patient_name:str, visit_date_iso:str, hhmm:str,
               duration_min:int=30, remind_min:int=10, location:str="Klinik")->bytes:
     dt_local=datetime.strptime(f"{visit_date_iso} {hhmm}","%Y-%m-%d %H:%M").replace(tzinfo=TR_TZ)
@@ -226,10 +241,11 @@ def google_calendar_link(patient_name, visit_date_iso, hhmm, duration_min:int=30
     return ("https://www.google.com/calendar/render?action=TEMPLATE"
             f"&text={quote_plus('Check-up – '+patient_name)}"
             f"&dates={s}/{e}&location={quote_plus(location)}&details={quote_plus('Check-up randevusu')}")
+
 def make_whatsapp_link(phone,text)->str:
     return f"https://wa.me/{normalize_phone(phone).replace('+','')}?text={quote_plus(text)}"
 
-# =============== THEME & EFFECTS ===============
+# ================== THEME & EFFECTS ==================
 def apply_theme(theme_name:str):
     THEMES={
         "Sistemle Uyumlu": """
@@ -266,16 +282,20 @@ st.markdown("""
 <style>
 section.main > div { animation: fadeIn .35s ease-in-out; }
 @keyframes fadeIn { from{opacity:0; transform:translateY(6px);} to{opacity:1; transform:none;} }
-.stButton>button,.stDownloadButton>button,.stLinkButton>button{ padding:.72rem 1rem!important; font-weight:600!important; border-radius:12px!important; transition:transform .15s ease, filter .15s ease;}
-.stButton>button:hover,.stDownloadButton>button:hover,.stLinkButton>button:hover{ transform:translateY(-1px); filter:saturate(1.05);}
+.stButton>button,.stDownloadButton>button,.stLinkButton>button{
+  padding:.72rem 1rem!important; font-weight:600!important; border-radius:12px!important;
+  transition:transform .15s ease, filter .15s ease;}
+.stButton>button:hover,.stDownloadButton>button:hover,.stLinkButton>button:hover{
+  transform:translateY(-1px); filter:saturate(1.05);}
 
 /* Paket kart/chip */
 .pkg-card{ border:1px solid var(--border); background:var(--card); border-radius:14px; padding:12px 14px; margin:8px 0; }
-.pkg-chip{ display:inline-block; padding:.35rem .6rem; border-radius:999px; background:var(--chip-bg); color:var(--chip-tx); margin:.22rem .28rem .22rem 0; font-size:.92rem; }
+.pkg-chip{ display:inline-block; padding:.35rem .6rem; border-radius:999px; background:var(--chip-bg); color:var(--chip-tx);
+  margin:.22rem .28rem .22rem 0; font-size:.92rem; }
 </style>
 """, unsafe_allow_html=True)
 
-# =============== AUTH (opsiyonel) ===============
+# ================== AUTH (opsiyonel) ==================
 def do_login_ui():
     st.title("🩺 Check-up Takip")
     with st.form("login_form"):
@@ -292,10 +312,10 @@ if "auth" not in st.session_state:
 if AUTH_ENABLED and not st.session_state.auth["logged_in"]:
     do_login_ui(); st.stop()
 
-# =============== THEME APPLY ===============
+# ================== THEME APPLY ==================
 apply_theme(get_setting("theme","Sistemle Uyumlu"))
 
-# =============== SIDEBAR ===============
+# ================== SIDEBAR ==================
 picked_date=st.sidebar.date_input("📅 Tarih", value=today_tr_date())
 sel_iso=to_iso(picked_date); sel_disp=to_display(picked_date)
 
@@ -337,13 +357,13 @@ with st.sidebar:
         sel=st.selectbox("Kişi seç", opts, index=idx)
         if st.button("Kaydet"): set_setting("default_recipient", sel[0] if sel[0] else ""); st.success("Kaydedildi")
 
-# =============== MAIN ===============
+# ================== MAIN ==================
 st.title("🩺 Check-up Takip Sistemi")
 tab_hasta, tab_tetkik, tab_paket, tab_ozet, tab_yedek = st.tabs(
     ["🧑‍⚕️ Hastalar","🧪 Tetkik Takibi","📦 Paketler","📊 Gün Özeti","💾 Yedek"]
 )
 
-# ---- Hastalar (sabit tablo + hızlı ekleme + isteğe bağlı paket) ----
+# -------- Hastalar --------
 with tab_hasta:
     st.subheader(f"{sel_disp} — Hasta Listesi")
     pts=list_patients(sel_iso)
@@ -375,8 +395,7 @@ with tab_hasta:
             pts2=list_patients(sel_iso)
             new_id=max([p[0] for p in pts2]) if pts2 else None
             if new_id and sel_pkgs:
-                for pid_pkg,_ in sel_pkgs:
-                    apply_package_to_patient(pid_pkg, new_id)
+                for pid_pkg,_ in sel_pkgs: apply_package_to_patient(pid_pkg, new_id)
             st.success("Hasta eklendi" + (f" (+ {len(sel_pkgs)} paket)" if sel_pkgs else ""))
             st.rerun()
 
@@ -385,7 +404,7 @@ with tab_hasta:
         choice=st.selectbox("Silinecek", [(p[0], f"{p[1]} {p[2]}") for p in pts], format_func=lambda x:x[1], key="del_pt_sel")
         if st.button("Sil"): delete_patient(choice[0]); st.success("Silindi"); st.rerun()
 
-# ---- Tetkik Takibi ----
+# -------- Tetkik Takibi --------
 with tab_tetkik:
     pts_today=list_patients(sel_iso)
     if not pts_today: st.info("Bu tarihte hasta yok.")
@@ -418,9 +437,7 @@ with tab_tetkik:
         if pkgs:
             cpa, cbtn = st.columns([3,1])
             pkg_sel=cpa.selectbox("Paket seç", [(k, n) for k,n in pkgs], format_func=lambda x:x[1])
-            if cbtn.button("Paketi uygula"):
-                apply_package_to_patient(pkg_sel[0], pid)
-                st.success(f"'{pkg_sel[1]}' paketi eklendi."); st.rerun()
+            if cbtn.button("Paketi uygula"): apply_package_to_patient(pkg_sel[0], pid); st.success(f"'{pkg_sel[1]}' paketi eklendi."); st.rerun()
             with st.expander("Paket içeriği"):
                 items=get_package_tests(pkg_sel[0])
                 if not items: st.info("Paket boş.")
@@ -428,12 +445,11 @@ with tab_tetkik:
                     st.markdown('<div class="pkg-card">', unsafe_allow_html=True)
                     cols = st.columns(2)
                     half = (len(items)+1)//2
-                    left = items[:half]; right = items[half:]
                     def _render(col, arr):
                         with col:
                             for idx,(_ptid, tname, _o) in enumerate(arr, start=1):
                                 st.markdown(f'<span class="pkg-chip">{idx}. {tname}</span>', unsafe_allow_html=True)
-                    _render(cols[0], left); _render(cols[1], right)
+                    _render(cols[0], items[:half]); _render(cols[1], items[half:])
                     st.markdown('</div>', unsafe_allow_html=True)
 
         st.markdown("#### Tetkikler")
@@ -480,7 +496,7 @@ with tab_tetkik:
                     if c3.button("Geri Al", key=f"undo_{tid}"): update_patient_test_status(tid,"bekliyor"); st.rerun()
                 if c4.button("Sil", key=f"del_{tid}"): delete_patient_test(tid); st.rerun()
 
-# ---- Paketler (CRUD + çok satırlı ekleme) ----
+# -------- Paketler --------
 with tab_paket:
     st.subheader("📦 Check‑up Paketleri")
     pkgs=list_packages()
@@ -526,8 +542,7 @@ with tab_paket:
                 if not lines: st.warning("En az bir satır girin.")
                 else:
                     base_ord=len(items)
-                    for i,name in enumerate(lines):
-                        add_test_to_package(sel_pkg[0], name, ord_hint=base_ord+i)
+                    for i,name in enumerate(lines): add_test_to_package(sel_pkg[0], name, ord_hint=base_ord+i)
                     st.success(f"{len(lines)} tetkik eklendi."); st.rerun()
         else:
             st.info("Henüz paket yok.")
@@ -560,7 +575,7 @@ with tab_paket:
                     if pid: add_test_to_package(pid, r["name_or_test"])
             st.success("İçe aktarıldı"); st.rerun()
 
-# ---- Gün Özeti ----
+# -------- Gün Özeti --------
 with tab_ozet:
     st.subheader(f"{sel_disp} — Gün Özeti")
     pts=list_patients(sel_iso)
@@ -586,7 +601,7 @@ with tab_ozet:
             st.download_button("📦 Kalan tetkiki olanların randevuları (.zip)", mem,
                                file_name=f"{sel_iso}_randevular_kalan.zip", mime="application/zip")
 
-# ---- Yedek ----
+# -------- Yedek --------
 with tab_yedek:
     st.subheader("Dışa Aktar (CSV)")
     def _csv(q):
