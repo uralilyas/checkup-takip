@@ -1,5 +1,5 @@
 # app.py
-# Check-up Takip Sistemi — tek dosya, Streamlit
+# Check-up Takip Sistemi — tek dosya / Streamlit
 import sqlite3, csv, io, zipfile
 from datetime import datetime, date, timedelta
 from contextlib import closing
@@ -11,7 +11,7 @@ import streamlit as st
 st.set_page_config(page_title="Check-up Takip", page_icon="🩺", layout="wide")
 DB_PATH = "checkup.db"
 TR_TZ = ZoneInfo("Europe/Istanbul")
-AUTH_ENABLED = False  # True yaparsan giriş ekranı: admin/admin
+AUTH_ENABLED = False  # True yaparsan login: admin/admin olur
 
 def now_tr(): return datetime.now(TR_TZ)
 def today_tr_date(): n=now_tr(); return date(n.year, n.month, n.day)
@@ -24,7 +24,15 @@ def normalize_phone(p:str)->str:
     return p
 
 # ================== DB ==================
-def get_conn(): return sqlite3.connect(DB_PATH, check_same_thread=False)
+def get_conn():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    try:
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA journal_mode=WAL")
+    except Exception:
+        pass
+    return conn
+
 def column_exists(conn,t,c)->bool:
     with closing(conn.cursor()) as cur:
         cur.execute(f"PRAGMA table_info({t})")
@@ -45,23 +53,29 @@ def init_db():
             age INTEGER, gender TEXT,
             visit_date TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT (datetime('now')))""")
-        # --- Şema onarımları / yükseltmeler ---
+        # Şema yükseltmeleri
         if not column_exists(conn,"patients","department"):
             c.execute("ALTER TABLE patients ADD COLUMN department TEXT")
             c.execute("UPDATE patients SET department='Genel' WHERE department IS NULL")
         if not column_exists(conn,"patients","visit_time"):
             c.execute("ALTER TABLE patients ADD COLUMN visit_time TEXT")
-        # created_at NULL ise doldur (eski kayıtlardan gelebilir)
         try:
             c.execute("UPDATE patients SET created_at = COALESCE(created_at, datetime('now'))")
         except sqlite3.OperationalError:
             pass
+        # patient_tests
         c.execute("""CREATE TABLE IF NOT EXISTS patient_tests(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            patient_id INTEGER NOT NULL, test_name TEXT NOT NULL,
+            patient_id INTEGER NOT NULL,
+            test_name TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'bekliyor',
             updated_at TEXT NOT NULL DEFAULT (datetime('now')),
             FOREIGN KEY(patient_id) REFERENCES patients(id))""")
+        if not column_exists(conn,"patient_tests","status"):
+            c.execute("ALTER TABLE patient_tests ADD COLUMN status TEXT NOT NULL DEFAULT 'bekliyor'")
+        if not column_exists(conn,"patient_tests","updated_at"):
+            c.execute("ALTER TABLE patient_tests ADD COLUMN updated_at TEXT")
+            c.execute("UPDATE patient_tests SET updated_at = COALESCE(updated_at, datetime('now'))")
         c.execute("""CREATE TABLE IF NOT EXISTS packages(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL UNIQUE,
@@ -74,7 +88,7 @@ def init_db():
             FOREIGN KEY(package_id) REFERENCES packages(id))""")
 
 def cleanup_old_patients():
-    """Dünkü ve öncesi hastaları (ve onların tetkiklerini) sil. Paketlere dokunma."""
+    """Dünkü ve öncesi hastaları (tetkikleriyle) sil — paketler kalır."""
     today_iso = to_iso(today_tr_date())
     with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
         c.execute("SELECT id FROM patients WHERE visit_date < ?", (today_iso,))
@@ -106,7 +120,7 @@ def list_personnel(active_only=True):
         c.execute(q); return c.fetchall()
 def upsert_personnel(name,phone,active:int):
     phone=normalize_phone(phone)
-    if not phone.startswith("+"): raise ValueError("Telefon +90… formatında olmalı")
+    if phone and not phone.startswith("+"): raise ValueError("Telefon +90… formatında olmalı")
     with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
         c.execute("SELECT id FROM personnel WHERE phone=?", (phone,))
         r=c.fetchone()
@@ -149,14 +163,38 @@ def list_patients(visit_date_iso:str|None=None):
             c.execute("""SELECT id,first_name,last_name,age,gender,department,visit_time
                          FROM patients ORDER BY visit_date DESC,last_name""")
         return c.fetchall()
+
+def _migrate_patient_tests_if_needed(conn, cur):
+    if not column_exists(conn,"patient_tests","status"):
+        cur.execute("ALTER TABLE patient_tests ADD COLUMN status TEXT NOT NULL DEFAULT 'bekliyor'")
+    if not column_exists(conn,"patient_tests","updated_at"):
+        cur.execute("ALTER TABLE patient_tests ADD COLUMN updated_at TEXT")
+        cur.execute("UPDATE patient_tests SET updated_at = COALESCE(updated_at, datetime('now'))")
+
 def add_patient_test(pid:int, test_name:str):
+    test_name = (test_name or "").strip()
+    if not test_name:
+        raise ValueError("Tetkik adı boş olamaz.")
     with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
-        c.execute("""INSERT INTO patient_tests(patient_id,test_name,status)
-                     VALUES(?,?,'bekliyor')""",(pid,test_name.strip()))
+        try:
+            # En güncel şema ile deneriz
+            c.execute("""INSERT INTO patient_tests(patient_id,test_name,status,updated_at)
+                         VALUES(?,?,?,?)""", (pid, test_name, 'bekliyor', now_str()))
+        except sqlite3.IntegrityError:
+            # Eski tabloda NOT NULL/constraint vb. sorun: şemayı onarıp tekrar dene
+            _migrate_patient_tests_if_needed(conn, c)
+            c.execute("""INSERT INTO patient_tests(patient_id,test_name,status,updated_at)
+                         VALUES(?,?,?,?)""", (pid, test_name, 'bekliyor', now_str()))
+        except sqlite3.OperationalError:
+            # Çok eski kurulumlarda sütun farklı olabilir
+            _migrate_patient_tests_if_needed(conn, c)
+            c.execute("""INSERT INTO patient_tests(patient_id,test_name,status,updated_at)
+                         VALUES(?,?,?,?)""", (pid, test_name, 'bekliyor', now_str()))
+
 def list_patient_tests(pid:int):
     with closing(get_conn()) as conn, closing(conn.cursor()) as c:
         c.execute("""SELECT id,patient_id,test_name,status,updated_at
-                     FROM patient_tests WHERE patient_id=? ORDER BY updated_at DESC""",(pid,))
+                     FROM patient_tests WHERE patient_id=? ORDER BY updated_at DESC, id DESC""",(pid,))
         return c.fetchall()
 def update_patient_test_status(tid:int, status:str):
     with closing(get_conn()) as conn, conn, closing(conn.cursor()) as c:
@@ -199,11 +237,10 @@ def delete_package(pkg_id:int):
         c.execute("DELETE FROM package_tests WHERE package_id=?", (pkg_id,))
         c.execute("DELETE FROM packages WHERE id=?", (pkg_id,))
 def apply_package_to_patient(pkg_id:int, patient_id:int):
-    tests=get_package_tests(pkg_id)
-    for _id, name, _ord in tests:
+    for _id, name, _ord in get_package_tests(pkg_id):
         add_patient_test(patient_id, name)
 
-# ================== CALENDAR / WA ==================
+# ================== CALENDAR / WHATSAPP LINKS ==================
 def build_ics(patient_name:str, visit_date_iso:str, hhmm:str,
               duration_min:int=30, remind_min:int=10, location:str="Klinik")->bytes:
     dt_local=datetime.strptime(f"{visit_date_iso} {hhmm}","%Y-%m-%d %H:%M").replace(tzinfo=TR_TZ)
@@ -425,12 +462,16 @@ with tab_tetkik:
                 hhmm=f"{hour}:{minute}"
             addt=st.form_submit_button("Ekle")
         if addt:
-            if not tname.strip(): st.warning("Tetkik adı zorunlu.")
-            else:
+            try:
                 add_patient_test(pid,tname)
-                if alarm and hhmm: set_patient_alarm_time(pid,hhmm); st.success(f"Tetkik + alarm {hhmm}")
-                else: st.success("Tetkik eklendi.")
+                if alarm and hhmm:
+                    set_patient_alarm_time(pid,hhmm)
+                    st.success(f"Tetkik + alarm {hhmm}")
+                else:
+                    st.success("Tetkik eklendi.")
                 st.rerun()
+            except ValueError as e:
+                st.warning(str(e))
 
         st.markdown("#### Paket Ata")
         pkgs=list_packages()
@@ -498,7 +539,7 @@ with tab_tetkik:
 
 # -------- Paketler --------
 with tab_paket:
-    st.subheader("📦 Check‑up Paketleri")
+    st.subheader("📦 Check-up Paketleri")
     pkgs=list_packages()
     col_a, col_b = st.columns([2,2])
     with col_a:
